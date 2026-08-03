@@ -56,8 +56,8 @@ Key design questions to resolve before writing code (do not guess — verify aga
 - How does Cambium avoid fighting with roles a Nexus admin assigned manually outside of Cambium's sync (don't blindly overwrite everything Cambium didn't itself create)?
 - Multi-realm support: v1 can assume a single Keycloak realm, but don't hardcode assumptions that make that impossible to extend later.
 
-### 3. ROPC support (v1 scope, per decision — full parity with the original integration)
-`oauth2-proxy` (or whichever proxy is chosen) needs to support password-grant login for CLI tools (`docker login`, `npm login`, `pip`/`uv` credentials) hitting Nexus directly, not through a browser redirect. This needs to be verified against the chosen proxy's actual capabilities — do not assume `oauth2-proxy` supports ROPC out of the box without checking; if it doesn't, this may require either a different proxy choice for the CLI path specifically, or a small dedicated ROPC-to-header-injection shim as part of Cambium itself.
+### 3. ROPC support (v1 scope, per decision — full parity with the original integration) — implemented
+`oauth2-proxy` does not support ROPC (verified — see [docs/oidc-proxy-pairing.md](./docs/oidc-proxy-pairing.md)), so this is a dedicated shim: `cambium ropc-proxy`, a subcommand of this same binary (`src/ropc.rs`), not a separate crate. It terminates `Authorization: Basic` from CLI tools (`docker login`, `npm login`, `pip`/`uv` credentials), exchanges the credentials against Keycloak's token endpoint (`grant_type=password`), extracts a configured identity claim, injects it as the RutAuth header, strips the original `Authorization` header, and reverse-proxies the request to Nexus. Full design, config shape, caching behavior, and security mitigations: [docs/oidc-proxy-pairing.md](./docs/oidc-proxy-pairing.md) section 3/4b.
 
 ## Non-goals for v1
 - Not a general SSO gateway — scoped specifically to Nexus.
