@@ -4,14 +4,38 @@ mod keycloak;
 mod lock;
 mod manifest;
 mod nexus;
+mod ropc;
 mod sync;
 
+use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
-use config::Config;
+use config::{Config, RopcConfig};
 use keycloak::KeycloakClient;
 use manifest::Manifest;
 use nexus::NexusClient;
+
+/// Cambium: a Keycloak/OIDC translator for Nexus Repository 3 CE. See
+/// ARCHITECTURE.md for the full design.
+#[derive(Parser, Debug)]
+#[command(name = "cambium", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Role-sync daemon: reconciles Keycloak group membership into Nexus
+    /// User/Role assignments (see docs/sync-semantics.md). This is the
+    /// default when no subcommand is given, for backward compatibility with
+    /// existing deployments that invoke `cambium` with no arguments.
+    Sync,
+    /// ROPC-to-header-injection HTTP proxy for CLI tools (docker/npm/pip)
+    /// that can't do a browser OIDC redirect. See
+    /// docs/oidc-proxy-pairing.md section 3/4b.
+    RopcProxy,
+}
 
 #[tokio::main]
 async fn main() {
@@ -23,6 +47,22 @@ async fn main() {
         .json()
         .init();
 
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Commands::Sync) {
+        Commands::Sync => run_sync().await,
+        Commands::RopcProxy => run_ropc_proxy().await,
+    }
+}
+
+async fn run_ropc_proxy() {
+    let config = RopcConfig::from_env();
+    if let Err(e) = ropc::run(config).await {
+        error!(error = %e, "ropc-proxy exited with an error");
+        std::process::exit(1);
+    }
+}
+
+async fn run_sync() {
     let config = Config::from_env();
     info!(
         keycloak_realm = %config.keycloak_realm,

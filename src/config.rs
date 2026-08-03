@@ -90,6 +90,48 @@ pub fn parse_role_map(raw: &str) -> CambiumResult<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Env-var configuration for `cambium ropc-proxy` (see
+/// `docs/oidc-proxy-pairing.md` section 4b for the reference shape). Kept as
+/// a separate struct from the sync daemon's [`Config`] because the two
+/// subcommands share no config surface at all — running both from the same
+/// env would be more confusing than a second `from_env()`.
+#[derive(Debug, Clone)]
+pub struct RopcConfig {
+    /// Keycloak realm issuer, e.g. `https://kc.example.com/realms/myrealm`.
+    /// The token endpoint is `{issuer}/protocol/openid-connect/token`.
+    pub keycloak_issuer: String,
+    pub keycloak_ropc_client_id: String,
+    pub keycloak_ropc_client_secret: String,
+    /// Which claim in the token response identifies the principal to hand
+    /// to Nexus via RutAuth. `preferred_username` by default, but
+    /// operator-configurable (e.g. `email`) per the design doc.
+    pub identity_claim: String,
+    /// Base URL of the Nexus instance this proxy sits in front of.
+    pub nexus_upstream: String,
+    /// Must match `RutAuthCapabilityConfiguration.httpHeader` on the Nexus
+    /// side exactly.
+    pub rutauth_header: String,
+    pub cache_ttl_seconds: u64,
+    pub listen_addr: String,
+}
+
+impl RopcConfig {
+    pub fn from_env() -> Self {
+        Self {
+            keycloak_issuer: env_require("KEYCLOAK_ISSUER"),
+            keycloak_ropc_client_id: env_require("KEYCLOAK_ROPC_CLIENT_ID"),
+            keycloak_ropc_client_secret: env_require("KEYCLOAK_ROPC_CLIENT_SECRET"),
+            identity_claim: env_or("IDENTITY_CLAIM", "preferred_username"),
+            nexus_upstream: env_require("NEXUS_UPSTREAM"),
+            rutauth_header: env_require("RUTAUTH_HEADER"),
+            cache_ttl_seconds: env_or("CACHE_TTL_SECONDS", "60")
+                .parse()
+                .expect("CACHE_TTL_SECONDS must be a number"),
+            listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:8090"),
+        }
+    }
+}
+
 fn env_require(key: &str) -> String {
     env::var(key).unwrap_or_else(|_| panic!("missing required env var: {key}"))
 }
