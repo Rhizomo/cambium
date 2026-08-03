@@ -1,0 +1,66 @@
+{
+  "realm": "cambium-dev",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      { "name": "nexus-admin", "description": "Maps to Nexus's built-in nx-admin role via Cambium's ROLE_MAP" }
+    ]
+  },
+  "groups": [
+    {
+      "name": "nexus-admins",
+      "realmRoles": ["nexus-admin"]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "cambium-sync",
+      "name": "Cambium sync daemon (service account, Keycloak Admin API)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "dev-cambium-sync-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "authorizationServicesEnabled": false
+    },
+    {
+      "clientId": "cambium-ropc",
+      "name": "Cambium ropc-proxy (dedicated ROPC client, per docs/oidc-proxy-pairing.md)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "dev-cambium-ropc-secret",
+      "serviceAccountsEnabled": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-cambium-sync",
+      "enabled": true,
+      "serviceAccountClientId": "cambium-sync",
+      "clientRoles": {
+        "realm-management": ["view-users", "query-groups", "query-users", "view-realm"]
+      }
+    },
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@example.com",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Example",
+      "credentials": [
+        { "type": "password", "value": "alice-password", "temporary": false }
+      ],
+      "groups": ["/nexus-admins"]
+    }
+  ]
+}
