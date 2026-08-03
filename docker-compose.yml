@@ -1,0 +1,112 @@
+# Local end-to-end dev stack for Cambium: Keycloak + a vanilla Nexus3 CE +
+# both Cambium subcommands, wired together so the whole
+# Keycloak-group -> Nexus-role / RutAuth-header path can actually be
+# exercised on a laptop. Never points at anything Smartech-internal --
+# every image here is a stock upstream image (Keycloak's own quay.io image,
+# Sonatype's own Docker Hub image), and this repo's own Dockerfile.
+#
+# All credentials in this file are fixed, throwaway dev-only values seeded
+# by dev/keycloak/realm-export.json and dev/nexus-init/init.sh. Do not reuse
+# them anywhere real.
+#
+# Quick start:
+#   docker compose up --build
+#   # wait for nexus-init to log "done." (one-shot, exits after)
+#   curl -u alice:alice-password http://localhost:8090/service/rest/v1/status
+#
+# Teardown (removes the Nexus/Keycloak data volumes too):
+#   docker compose down -v
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    volumes:
+      - ./dev/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  nexus:
+    image: sonatype/nexus3:latest
+    volumes:
+      - nexus-data:/nexus-data
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/service/rest/v1/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  nexus-init:
+    image: alpine:3.20
+    environment:
+      NEXUS_URL: http://nexus:8081
+      DEV_ADMIN_PASSWORD: admin123
+      RUTAUTH_HEADER: X-Forwarded-User
+      ADMIN_PASSWORD_FILE: /nexus-data/admin.password
+    volumes:
+      - ./dev/nexus-init/init.sh:/init/init.sh:ro
+      - nexus-data:/nexus-data:ro
+    command: ["sh", "-c", "apk add --no-cache curl jq >/dev/null && /bin/sh /init/init.sh"]
+    depends_on:
+      nexus:
+        condition: service_healthy
+    restart: "no"
+
+  cambium-sync:
+    build: .
+    command: ["sync"]
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: cambium-dev
+      KEYCLOAK_CLIENT_ID: cambium-sync
+      KEYCLOAK_CLIENT_SECRET: dev-cambium-sync-secret
+      NEXUS_URL: http://nexus:8081
+      NEXUS_USERNAME: admin
+      NEXUS_PASSWORD: admin123
+      ROLE_MAP: "nexus-admin:nx-admin"
+      POLL_INTERVAL_SECONDS: "30"
+      STATE_FILE: /var/lib/cambium/state.json
+      LOCK_FILE: /var/lib/cambium/cambium.lock
+      RUST_LOG: info
+    volumes:
+      - cambium-state:/var/lib/cambium
+    depends_on:
+      nexus-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+    restart: unless-stopped
+
+  cambium-ropc-proxy:
+    build: .
+    command: ["ropc-proxy"]
+    environment:
+      KEYCLOAK_ISSUER: http://keycloak:8080/realms/cambium-dev
+      KEYCLOAK_ROPC_CLIENT_ID: cambium-ropc
+      KEYCLOAK_ROPC_CLIENT_SECRET: dev-cambium-ropc-secret
+      IDENTITY_CLAIM: preferred_username
+      NEXUS_UPSTREAM: http://nexus:8081
+      RUTAUTH_HEADER: X-Forwarded-User
+      CACHE_TTL_SECONDS: "60"
+      LISTEN_ADDR: 0.0.0.0:8090
+      RUST_LOG: info
+    ports:
+      - "8090:8090"
+    depends_on:
+      nexus-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  nexus-data:
+  cambium-state:
