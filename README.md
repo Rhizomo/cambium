@@ -6,7 +6,9 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design and why this approa
 
 ## Status
 
-Early design phase — architecture decided, implementation starting. Not yet usable.
+v1 role-sync daemon implemented. See [docs/sync-semantics.md](./docs/sync-semantics.md) for how it reconciles Keycloak group membership into Nexus roles without clobbering manually-assigned ones.
+
+> **Run exactly one instance.** Cambium's sync manifest is a plain JSON file with no internal locking. v1 enforces this at startup with an OS-level `flock` (`LOCK_FILE`, default `/var/lib/cambium/cambium.lock`) — a second instance pointed at the same lock file refuses to start rather than racing on the manifest. Do not scale this deployment beyond `replicas: 1`. See [docs/sync-semantics.md](./docs/sync-semantics.md) for why.
 
 ## The short version
 
