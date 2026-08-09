@@ -3,13 +3,13 @@
 This document answers the three open design questions from `ARCHITECTURE.md`'s
 "Role-sync daemon" section, based on live testing against Keycloak's public
 Admin REST API documentation and a disposable local `sonatype/nexus3:latest`
-container (never against any Smartech-internal system).
+container (never against any private/internal system).
 
 ## 1. Nexus user/role API shape (verified against a local Nexus 3 container)
 
 Tested directly against `/service/rest/v1/security/*` on a throwaway
 `sonatype/nexus3:latest` container (torn down after testing, never a
-Smartech-managed instance):
+production instance):
 
 - **User creation and role assignment happen in one call.** `POST
   /v1/security/users` takes an `ApiCreateUser` body that includes a `roles:
@@ -98,6 +98,64 @@ REST API reference and corroborated by community reports of the same
 "composite endpoint doesn't expand groups" gap. It should be treated as
 verified-by-documentation, not verified-by-live-call, and is flagged as the
 one open item in the final report.
+
+### User discovery: who does a pass even consider
+
+A v1 pass discovered candidate users solely by traversing group membership
+(`list_groups` + `group_members`), on the theory that this avoided a
+full-realm user dump. That missed a real case: a user (or service account)
+with a realm role assigned **directly** and no group membership at all was
+invisible to Cambium and never got any Nexus access, without so much as a
+warning.
+
+Fixed by adding a second discovery source, `GET
+/admin/realms/{realm}/roles/{role-name}/users` — verified against
+keycloak/keycloak GitHub issues #19391 and #37209 to return only users with
+`role-name` assigned directly (no group-inherited or composite-expanded
+members). `run_pass` now calls this once per Keycloak role name present in
+`ROLE_MAP` and unions the result into the same user set group traversal
+produces:
+
+```
+candidate_users = ⋃_{g in groups(recursive)} group_members(g)
+                 ∪ ⋃_{r in ROLE_MAP.keys()} users_with_direct_realm_role(r)
+
+groups(recursive) = ⋃_{top-level g} descendants(g)   -- g itself plus every
+                                                       -- subgroup, to
+                                                       -- arbitrary nesting
+                                                       -- depth
+```
+
+Discovery-set membership doesn't change what a user is granted — once
+discovered by either path, `effective_realm_roles` (above) recomputes their
+full direct-or-group-inherited role set from scratch. If a role name in
+`ROLE_MAP` doesn't exist in Keycloak (typo, or the role was deleted after
+`ROLE_MAP` was written), the per-role lookup 404s; Cambium logs a warning
+and treats it as zero direct-role users for that role rather than failing
+the whole pass — consistent with how per-user failures elsewhere in
+`run_pass` are logged and skipped, not fatal.
+
+**Fixed — subgroup discovery is now recursive:** `list_groups` calls only
+`GET /admin/realms/{realm}/groups`, which returns top-level groups with a
+`subGroupCount` but an **empty** `subGroups` array — Keycloak requires a
+separate `GET /groups/{id}/children` call (`KeycloakClient::group_children`)
+to actually enumerate a group's *immediate* subgroups, and that call has to
+be repeated per level to reach arbitrarily nested subgroups-of-subgroups.
+`run_pass` now walks that tree via `discover_group_tree_members`
+(`src/sync.rs`): starting from every top-level group, it breadth-first
+fetches `group_children` and `group_members` for every group it visits,
+tracking visited group ids so a (Keycloak-disallowed, but not
+trust-assumed) cycle can't spin forever, and unions every group's and
+subgroup's members into the same discovery set via `merge_users`. Confirmed
+live in the dev stack (`dev/keycloak/realm-export.json`): the two users in
+`/team-gamma/team-gamma-leads` with no direct `/team-gamma` membership,
+`user-gamma-lead-1` and `user-gamma-lead-2`, now appear in Nexus after a
+sync pass with `nx-publisher` — `/team-gamma`'s mapped role, correctly
+inherited since the subgroup itself carries no separate role mapping. The
+role-inheritance math was never the bug (a direct query of the subgroup's
+own `role-mappings/realm/composite` always correctly resolved the parent's
+mapped role) — this was purely a discovery gap, now closed alongside the
+direct-role-only gap above.
 
 ## 3. Avoiding clobbering manually-assigned Nexus roles
 

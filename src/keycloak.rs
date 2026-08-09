@@ -171,6 +171,43 @@ impl KeycloakClient {
         self.get(&url).await
     }
 
+    /// `GET /admin/realms/{realm}/groups/{id}/children` — a group's
+    /// **immediate** subgroups only, not a full recursive tree. `list_groups`
+    /// (`GET /groups`) returns top-level groups with a `subGroupCount` but an
+    /// always-empty `subGroups` array, so this is the only way to actually
+    /// enumerate a group's children; walking arbitrarily nested subgroups
+    /// requires calling this once per level (see `run_pass`'s traversal in
+    /// `src/sync.rs`).
+    pub async fn group_children(&self, realm: &str, group_id: &str) -> CambiumResult<Vec<KcGroup>> {
+        let url = format!(
+            "{}/groups/{}/children?briefRepresentation=true&max=1000",
+            self.realm_url(realm),
+            group_id
+        );
+        self.get(&url).await
+    }
+
+    /// `GET /admin/realms/{realm}/roles/{role-name}/users` — users with
+    /// `role-name` assigned **directly**. Verified against keycloak/keycloak
+    /// GitHub issues #19391 and #37209: this endpoint does not include
+    /// members who only have the role via group inheritance, nor via
+    /// composite-role expansion. It is the exact complement of the
+    /// group-membership traversal in `run_pass` — a user with a realm role
+    /// assigned directly but no group membership at all is otherwise
+    /// invisible to Cambium (see `docs/sync-semantics.md` section 2).
+    pub async fn users_with_direct_realm_role(
+        &self,
+        realm: &str,
+        role_name: &str,
+    ) -> CambiumResult<Vec<KcUser>> {
+        let url = format!(
+            "{}/roles/{}/users?max=1000",
+            self.realm_url(realm),
+            urlencoding::encode(role_name)
+        );
+        self.get(&url).await
+    }
+
     /// `GET /admin/realms/{realm}/users/{id}/groups` — the groups a user directly belongs to.
     pub async fn user_groups(&self, realm: &str, user_id: &str) -> CambiumResult<Vec<KcGroup>> {
         let url = format!("{}/users/{}/groups", self.realm_url(realm), user_id);

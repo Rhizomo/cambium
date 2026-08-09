@@ -5,13 +5,53 @@
   "registrationAllowed": false,
   "roles": {
     "realm": [
-      { "name": "nexus-admin", "description": "Maps to Nexus's built-in nx-admin role via Cambium's ROLE_MAP" }
+      { "name": "nexus-admin", "description": "Maps to Nexus's built-in nx-admin role via Cambium's ROLE_MAP" },
+      { "name": "role-viewer", "description": "Synthetic bridge role: read-only access, mirrors a group->role pattern" },
+      { "name": "role-editor", "description": "Synthetic bridge role: read/write access" },
+      { "name": "role-publisher", "description": "Synthetic bridge role: publish access" },
+      { "name": "role-auditor", "description": "Synthetic bridge role: audit/read access" },
+      { "name": "role-ops", "description": "Synthetic bridge role: used both via group mapping and direct-assignment test users" },
+      { "name": "role-billing", "description": "Synthetic bridge role: used both via group mapping and direct-assignment test users" },
+      {
+        "name": "role-superuser",
+        "description": "Composite role bundling role-viewer + role-ops + role-billing, to exercise Cambium's composite-role expansion (both group-mapped and directly-assigned)",
+        "composite": true,
+        "composites": {
+          "realm": ["role-viewer", "role-ops", "role-billing"]
+        }
+      }
     ]
   },
   "groups": [
     {
       "name": "nexus-admins",
       "realmRoles": ["nexus-admin"]
+    },
+    {
+      "name": "team-alpha",
+      "realmRoles": ["role-viewer"]
+    },
+    {
+      "name": "team-beta",
+      "realmRoles": ["role-editor"]
+    },
+    {
+      "name": "team-gamma",
+      "realmRoles": ["role-publisher"],
+      "subGroups": [
+        {
+          "name": "team-gamma-leads",
+          "realmRoles": []
+        }
+      ]
+    },
+    {
+      "name": "team-delta",
+      "realmRoles": ["role-auditor"]
+    },
+    {
+      "name": "team-epsilon",
+      "realmRoles": ["role-superuser"]
     }
   ],
   "clients": [
@@ -61,6 +101,32 @@
         { "type": "password", "value": "alice-password", "temporary": false }
       ],
       "groups": ["/nexus-admins"]
-    }
+    },
+
+    { "username": "user-alpha-1", "enabled": true, "email": "user-alpha-1@example.com", "firstName": "Alpha", "lastName": "One", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-alpha"] },
+    { "username": "user-alpha-2", "enabled": true, "email": "user-alpha-2@example.com", "firstName": "Alpha", "lastName": "Two", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-alpha"] },
+    { "username": "user-alpha-3", "enabled": true, "email": "user-alpha-3@example.com", "firstName": "Alpha", "lastName": "Three", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-alpha"] },
+
+    { "username": "user-beta-1", "enabled": true, "email": "user-beta-1@example.com", "firstName": "Beta", "lastName": "One", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-beta"] },
+    { "username": "user-beta-2", "enabled": true, "email": "user-beta-2@example.com", "firstName": "Beta", "lastName": "Two", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-beta"] },
+    { "username": "user-beta-3", "enabled": true, "email": "user-beta-3@example.com", "firstName": "Beta", "lastName": "Three", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-beta"] },
+
+    { "username": "user-gamma-1", "enabled": true, "email": "user-gamma-1@example.com", "firstName": "Gamma", "lastName": "One", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-gamma"] },
+    { "username": "user-gamma-2", "enabled": true, "email": "user-gamma-2@example.com", "firstName": "Gamma", "lastName": "Two", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-gamma"] },
+
+    { "username": "user-gamma-lead-1", "enabled": true, "email": "user-gamma-lead-1@example.com", "firstName": "GammaLead", "lastName": "One", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-gamma/team-gamma-leads"] },
+    { "username": "user-gamma-lead-2", "enabled": true, "email": "user-gamma-lead-2@example.com", "firstName": "GammaLead", "lastName": "Two", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-gamma/team-gamma-leads"] },
+
+    { "username": "user-delta-1", "enabled": true, "email": "user-delta-1@example.com", "firstName": "Delta", "lastName": "One", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-delta"] },
+    { "username": "user-delta-2", "enabled": true, "email": "user-delta-2@example.com", "firstName": "Delta", "lastName": "Two", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-delta"] },
+    { "username": "user-delta-3", "enabled": true, "email": "user-delta-3@example.com", "firstName": "Delta", "lastName": "Three", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-delta"] },
+
+    { "username": "user-epsilon-1", "enabled": true, "email": "user-epsilon-1@example.com", "firstName": "Epsilon", "lastName": "One", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-epsilon"] },
+    { "username": "user-epsilon-2", "enabled": true, "email": "user-epsilon-2@example.com", "firstName": "Epsilon", "lastName": "Two", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-epsilon"] },
+
+    { "username": "svc-direct-1", "enabled": true, "email": "svc-direct-1@example.com", "firstName": "Direct", "lastName": "RoleOps", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "realmRoles": ["role-ops"] },
+    { "username": "svc-direct-2", "enabled": true, "email": "svc-direct-2@example.com", "firstName": "Direct", "lastName": "RoleBilling", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "realmRoles": ["role-billing"] },
+    { "username": "svc-direct-3", "enabled": true, "email": "svc-direct-3@example.com", "firstName": "Direct", "lastName": "RoleViewer", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "realmRoles": ["role-viewer"] },
+    { "username": "svc-direct-4", "enabled": true, "email": "svc-direct-4@example.com", "firstName": "Direct", "lastName": "RoleSuperuser", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "realmRoles": ["role-superuser"] }
   ]
 }

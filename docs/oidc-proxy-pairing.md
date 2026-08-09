@@ -57,8 +57,9 @@ class of bug entirely.**
 
 ## 2. Envoy's native OIDC filter: same gap, not a better single-proxy answer
 
-Checked because Smartech's own `devops-v2` cluster runs Envoy Gateway, and a
-single-proxy answer would be simpler than pairing two components.
+Checked because Envoy Gateway is a common choice for exactly this kind of
+deployment, and a single-proxy answer would be simpler than pairing two
+components.
 
 - Envoy Gateway's `SecurityPolicy.oidc` (as of v1.8) is documented as
   generating exactly one native `envoy.filters.http.oauth2` HTTP filter — it
@@ -113,7 +114,12 @@ for CLI clients, kept off the browser-facing OIDC route):
 5. Short-lived in-memory cache keyed by `sha256(username + password)` (never
    plaintext), TTL well under the access token lifetime (e.g. 60s), so a
    `docker pull` with dozens of layer requests doesn't hit Keycloak's token
-   endpoint once per blob. No disk persistence, cleared on restart.
+   endpoint once per blob. No disk persistence, cleared on restart. Concurrent
+   requests that all miss the cache for the same credential before any of
+   them finishes also share a single real exchange
+   (`TokenCache::coalesced_exchange`, `ropc.rs`) rather than each opening
+   their own — see `docs/load-test-results.md` section 2b for the live
+   before/after measurement.
 
 ### Prerequisite Keycloak-side config
 
@@ -170,11 +176,17 @@ skip_provider_button = true
 ```
 
 Nexus side: set the RutAuth capability's `httpHeader` field to
-`X-Forwarded-User` (or `X-Forwarded-Preferred-Username`, whichever claim the
-deployer wants as the Nexus principal — must match whatever Keycloak claim
-populates it) — this is the one field in
-`RutAuthCapabilityConfiguration`, no header-rename step needed since the
-value is directly configurable.
+`X-Forwarded-Preferred-Username` (or `X-Forwarded-Email`) — **not**
+`X-Forwarded-User`. Confirmed live via a header-echo debug backend (not
+assumed): oauth2-proxy's `X-Forwarded-User` carries the OIDC `sub` claim
+(the IdP's opaque internal user ID, e.g. a UUID), not the username or email.
+Cambium's sync daemon creates Nexus accounts keyed by username/email, so
+pointing RutAuth at `X-Forwarded-User` makes it trust a real, correctly
+authenticated identity that simply never matches any Nexus account —
+Nexus falls through to its own login prompt with no obvious error pointing
+at the real cause. This is the one field in `RutAuthCapabilityConfiguration`,
+no header-rename step needed since the value is directly configurable — just
+don't pick `X-Forwarded-User` for it.
 
 ### 4b. CLI path — dedicated ROPC shim
 

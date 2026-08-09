@@ -18,6 +18,7 @@
 //! plaintext.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,6 +50,8 @@ pub enum RopcError {
     UpstreamRequest(#[from] reqwest::Error),
     #[error("identity claim value is not a valid HTTP header value: {0:?}")]
     IdentityNotHeaderSafe(String),
+    #[error(transparent)]
+    CoalescedExchange(Arc<RopcError>),
 }
 
 // ---------------------------------------------------------------------
@@ -287,8 +290,16 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
+// A key's `OnceCell` only ever lives in this map while its exchange is
+// in-flight — the initiating caller removes it as soon as `get_or_init`
+// resolves (success or failure), so a later, non-concurrent request for the
+// same key always finds the map empty and starts a fresh attempt rather than
+// awaiting a completed-and-discarded cell.
+type InflightMap = Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<String, Arc<RopcError>>>>>>;
+
 pub struct TokenCache<C: Clock> {
     entries: Mutex<HashMap<String, CacheEntry>>,
+    inflight: InflightMap,
     ttl: Duration,
     clock: C,
 }
@@ -297,6 +308,7 @@ impl<C: Clock> TokenCache<C> {
     pub fn new(ttl: Duration, clock: C) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             ttl,
             clock,
         }
@@ -318,12 +330,61 @@ impl<C: Clock> TokenCache<C> {
         let expires_at = self.clock.now() + self.ttl;
         self.entries.lock().unwrap().insert(key, CacheEntry { identity, expires_at });
     }
+
+    // Singleflight coalescing for concurrent misses on the same key. The
+    // `entries` mutex above is intentionally left untouched by this: it's
+    // only ever held across the in-memory get/insert, never across an
+    // `.await`, and that must stay true for distinct keys not to serialize
+    // each other (see `docs/load-test-results.md` section 2d). This second,
+    // separate `inflight` mutex has the same property — held only long
+    // enough to look up/insert the per-key `OnceCell`, never across the
+    // exchange itself, so distinct keys still run their exchanges fully
+    // concurrently.
+    //
+    // `OnceCell::get_or_init` (not `get_or_try_init`) is used deliberately:
+    // `get_or_try_init` leaves the cell uninitialized on error, so the next
+    // concurrently-queued waiter would itself retry the real exchange —
+    // exactly the storm this exists to prevent, just shifted from N
+    // concurrent exchanges to a cascade of up-to-N sequential ones. Folding
+    // the `Result` into the cell's value type makes `get_or_init` itself
+    // infallible, so one exchange attempt settles every concurrent waiter
+    // for that key, success or failure alike.
+    async fn coalesced_exchange<F, Fut>(&self, username: &str, password: &str, do_exchange: F) -> Result<String, RopcError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<String, RopcError>>,
+    {
+        let key = cache_key(username, password);
+        let cell = {
+            let mut inflight = self.inflight.lock().unwrap();
+            inflight.entry(key.clone()).or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())).clone()
+        };
+
+        let result = cell.get_or_init(|| async { do_exchange().await.map_err(Arc::new) }).await.clone();
+
+        {
+            let mut inflight = self.inflight.lock().unwrap();
+            if let Some(current) = inflight.get(&key) {
+                if Arc::ptr_eq(current, &cell) {
+                    inflight.remove(&key);
+                }
+            }
+        }
+
+        result.map_err(RopcError::CoalescedExchange)
+    }
 }
 
 /// The full authenticate-or-reject decision: cache hit, or exchange +
 /// extract + cache. Deliberately network/IO-free apart from `exchanger`, so
 /// it's testable against a fake exchanger + fake clock without a live
 /// Keycloak.
+///
+/// Concurrent misses on the same `username`+`password` share one real
+/// exchange via `TokenCache::coalesced_exchange` rather than each starting
+/// their own — see that method's comment and
+/// `docs/load-test-results.md` section 2b for the live-measured problem this
+/// fixes.
 pub async fn authenticate<C: Clock>(
     username: &str,
     password: &str,
@@ -335,8 +396,13 @@ pub async fn authenticate<C: Clock>(
         return Ok(identity);
     }
 
-    let token = exchanger.exchange(username, password).await?;
-    let identity = extract_identity_claim(&token, identity_claim)?;
+    let identity = cache
+        .coalesced_exchange(username, password, || async move {
+            let token = exchanger.exchange(username, password).await?;
+            extract_identity_claim(&token, identity_claim)
+        })
+        .await?;
+
     cache.put(username, password, identity.clone());
     Ok(identity)
 }
@@ -505,6 +571,32 @@ pub fn build_router(state: Arc<RopcState>) -> Router {
     Router::new().fallback(any(proxy_handler)).with_state(state)
 }
 
+/// Resolves once either `SIGTERM` (the signal Kubernetes sends on a pod
+/// eviction/rolling update) or `SIGINT` (Ctrl-C, for local dev) is received.
+/// Passed to `axum::serve(...).with_graceful_shutdown(...)`, which stops
+/// accepting new connections and waits for in-flight ones to finish before
+/// returning — see the "Known gap" paragraph this replaces in
+/// docs/operations.md for why that distinction matters on every routine
+/// deploy, not just crashes.
+async fn shutdown_signal() {
+    let sigterm = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    let sigint = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install SIGINT handler");
+    };
+
+    tokio::select! {
+        _ = sigterm => info!("received SIGTERM, draining in-flight requests"),
+        _ = sigint => info!("received SIGINT, draining in-flight requests"),
+    }
+}
+
 pub async fn run(config: RopcConfig) -> anyhow::Result<()> {
     info!(
         listen_addr = %config.listen_addr,
@@ -537,7 +629,10 @@ pub async fn run(config: RopcConfig) -> anyhow::Result<()> {
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     info!(addr = %config.listen_addr, "listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    info!("graceful drain complete, exiting");
     Ok(())
 }
 
@@ -769,6 +864,166 @@ mod tests {
         let second = authenticate("alice", "wrongpw", &exchanger, &cache, "preferred_username").await;
         assert!(second.is_err());
         assert_eq!(exchanger.calls.load(Ordering::SeqCst), 2, "a failed exchange must never be cached — every attempt re-checks Keycloak");
+    }
+
+    // -------------------------------------------------------------
+    // Singleflight coalescing of concurrent misses on the same key
+    // -------------------------------------------------------------
+
+    struct GatedExchanger {
+        calls: AtomicUsize,
+        gate: tokio::sync::Notify,
+        identity: String,
+        should_fail: bool,
+    }
+
+    #[async_trait]
+    impl TokenExchanger for GatedExchanger {
+        async fn exchange(&self, _username: &str, _password: &str) -> Result<TokenResponse, RopcError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.gate.notified().await;
+            if self.should_fail {
+                Err(RopcError::InvalidCredentials)
+            } else {
+                let id_token = fake_jwt(serde_json::json!({"preferred_username": self.identity}));
+                Ok(TokenResponse { access_token: "irrelevant".to_string(), id_token: Some(id_token) })
+            }
+        }
+    }
+
+    struct SlowExchanger {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TokenExchanger for SlowExchanger {
+        async fn exchange(&self, username: &str, _password: &str) -> Result<TokenResponse, RopcError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let id_token = fake_jwt(serde_json::json!({"preferred_username": username}));
+            Ok(TokenResponse { access_token: "irrelevant".to_string(), id_token: Some(id_token) })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_for_the_same_credential_share_one_exchange() {
+        let exchanger = Arc::new(GatedExchanger {
+            calls: AtomicUsize::new(0),
+            gate: tokio::sync::Notify::new(),
+            identity: "alice".to_string(),
+            should_fail: false,
+        });
+        let cache = Arc::new(TokenCache::new(Duration::from_secs(60), FakeClock::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let exchanger = exchanger.clone();
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                authenticate("alice", "pw", exchanger.as_ref(), cache.as_ref(), "preferred_username").await
+            }));
+        }
+
+        // Let the scheduler run every spawned task up to the point where the
+        // single leader has entered `exchange()` and is blocked on the gate;
+        // the other 9 must be blocked on the shared `OnceCell` instead of
+        // ever calling `exchange()` themselves.
+        while exchanger.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        exchanger.gate.notify_waiters();
+
+        for handle in handles {
+            assert_eq!(handle.await.unwrap().unwrap(), "alice");
+        }
+        assert_eq!(
+            exchanger.calls.load(Ordering::SeqCst),
+            1,
+            "10 concurrent misses on the same credential must result in exactly one real exchange"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_misses_for_different_credentials_are_not_serialized() {
+        let exchanger = Arc::new(SlowExchanger { calls: AtomicUsize::new(0) });
+        let cache = Arc::new(TokenCache::new(Duration::from_secs(60), FakeClock::new()));
+
+        let e1 = exchanger.clone();
+        let c1 = cache.clone();
+        let alice = tokio::spawn(async move {
+            authenticate("alice", "pw", e1.as_ref(), c1.as_ref(), "preferred_username").await
+        });
+
+        while exchanger.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let e2 = exchanger.clone();
+        let c2 = cache.clone();
+        let bob = tokio::spawn(async move {
+            authenticate("bob", "pw", e2.as_ref(), c2.as_ref(), "preferred_username").await
+        });
+
+        while exchanger.calls.load(Ordering::SeqCst) == 1 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            exchanger.calls.load(Ordering::SeqCst),
+            2,
+            "bob's distinct-key exchange must start while alice's is still in-flight, not wait behind it"
+        );
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+
+        assert_eq!(alice.await.unwrap().unwrap(), "alice");
+        assert_eq!(bob.await.unwrap().unwrap(), "bob");
+    }
+
+    #[tokio::test]
+    async fn a_failed_exchange_is_shared_by_every_concurrent_waiter_then_retried_fresh_later() {
+        let exchanger = Arc::new(GatedExchanger {
+            calls: AtomicUsize::new(0),
+            gate: tokio::sync::Notify::new(),
+            identity: "alice".to_string(),
+            should_fail: true,
+        });
+        let cache = Arc::new(TokenCache::new(Duration::from_secs(60), FakeClock::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let exchanger = exchanger.clone();
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                authenticate("alice", "pw", exchanger.as_ref(), cache.as_ref(), "preferred_username").await
+            }));
+        }
+
+        while exchanger.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        exchanger.gate.notify_waiters();
+
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_err(), "every concurrent waiter must observe the shared failure");
+        }
+        assert_eq!(
+            exchanger.calls.load(Ordering::SeqCst),
+            1,
+            "a failed exchange must be shared across waiters, not retried once per waiter"
+        );
+
+        // The in-flight cell must have been cleaned up so this later,
+        // non-concurrent call re-checks Keycloak fresh instead of hanging on
+        // the discarded (already-resolved) cell.
+        exchanger.gate.notify_one();
+        let second = authenticate("alice", "pw", exchanger.as_ref(), cache.as_ref(), "preferred_username").await;
+        assert!(second.is_err());
+        assert_eq!(
+            exchanger.calls.load(Ordering::SeqCst),
+            2,
+            "a later call for the same key after the in-flight exchange settled must attempt a fresh exchange"
+        );
     }
 
     #[test]

@@ -34,7 +34,8 @@ That means Nexus already knows how to trust an externally-authenticated identity
                                     ▼
                       ┌─────────────────────────────────────────┐
                       │         Cambium (this project)            │
-                      │   Reads Keycloak group membership          │
+                      │   Reads Keycloak group membership and       │
+                      │   direct realm-role assignment             │
                       │   Mirrors it into Nexus's native User/Role │
                       │   model via Nexus's own REST API           │
                       └─────────────────────────────────────────┘
@@ -48,13 +49,14 @@ RutAuth only solves **authentication** (who is this). It says nothing about **au
 We don't build another OIDC proxy — that's a solved, mature problem (`oauth2-proxy` is the reference choice: widely used, actively maintained, handles both Authorization Code flow for browsers and can be configured for service-account/CLI flows). Cambium's job here is documentation + a tested reference config: how to point it at a Keycloak realm, how to configure it to inject the right header name matching Nexus's `RutAuthCapabilityConfiguration.httpHeader`, and how to wire the two together end-to-end (probably via Envoy/nginx/Traefik in front of both, matching whatever reverse-proxy the deployer already runs).
 
 ### 2. Role-sync daemon (the actual code)
-Reads Keycloak group/role membership (via Keycloak's Admin REST API — same API surface Grafter already knows how to talk to) and reconciles it into Nexus's native `User`/`Role` assignments (via Nexus's own REST API, `/service/rest/v1/security/*`). Runs on an interval (polling) in v1; a webhook/event-driven model is a plausible v2 if Keycloak's event listener SPI turns out to support it cleanly — don't over-engineer v1 around that assumption.
+Reads Keycloak group membership and direct realm-role assignment (via Keycloak's Admin REST API — same API surface Grafter already knows how to talk to) and reconciles it into Nexus's native `User`/`Role` assignments (via Nexus's own REST API, `/service/rest/v1/security/*`). Runs on an interval (polling) in v1; a webhook/event-driven model is a plausible v2 if Keycloak's event listener SPI turns out to support it cleanly — don't over-engineer v1 around that assumption.
 
 Key design questions to resolve before writing code (do not guess — verify against real Keycloak/Nexus REST APIs):
 - Does Nexus's REST API support creating/updating a `User` with roles in one call, or does it require separate user-creation and role-assignment calls?
 - What happens to a Nexus user whose Keycloak group membership is removed — does Cambium revoke the Nexus role (destructive, needs to be deliberate and safe), or just stop granting new ones (safer default, but roles can go stale)?
 - How does Cambium avoid fighting with roles a Nexus admin assigned manually outside of Cambium's sync (don't blindly overwrite everything Cambium didn't itself create)?
 - Multi-realm support: v1 can assume a single Keycloak realm, but don't hardcode assumptions that make that impossible to extend later.
+- Which users does a pass even consider? Resolved: group-membership traversal alone missed users with a realm role assigned directly and no group membership at all (the classic case is a service account with a direct role grant, never put in a group) — `run_pass` now also queries, per Keycloak role name in `ROLE_MAP`, everyone with that role assigned directly (`GET /admin/realms/{realm}/roles/{role-name}/users`), and unions both sources. It also missed users who belong only to a *subgroup* of a top-level group — `GET /groups` never returns nested subgroups, so `run_pass` now walks each top-level group's full subgroup tree recursively (`GET /groups/{id}/children`, repeated to arbitrary nesting depth) and includes every subgroup's members too. See `docs/sync-semantics.md` section 2.
 
 ### 3. ROPC support (v1 scope, per decision — full parity with the original integration) — implemented
 `oauth2-proxy` does not support ROPC (verified — see [docs/oidc-proxy-pairing.md](./docs/oidc-proxy-pairing.md)), so this is a dedicated shim: `cambium ropc-proxy`, a subcommand of this same binary (`src/ropc.rs`), not a separate crate. It terminates `Authorization: Basic` from CLI tools (`docker login`, `npm login`, `pip`/`uv` credentials), exchanges the credentials against Keycloak's token endpoint (`grant_type=password`), extracts a configured identity claim, injects it as the RutAuth header, strips the original `Authorization` header, and reverse-proxies the request to Nexus. Full design, config shape, caching behavior, and security mitigations: [docs/oidc-proxy-pairing.md](./docs/oidc-proxy-pairing.md) section 3/4b.

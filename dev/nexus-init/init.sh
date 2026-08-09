@@ -51,6 +51,20 @@ else
   exit 1
 fi
 
+echo "[nexus-init] ensuring the custom Nexus roles that dev/keycloak/realm-export.json's ROLE_MAP targets exist ..."
+for ROLE_ID in nx-viewer nx-editor nx-publisher nx-auditor nx-ops nx-billing nx-superuser; do
+  if curl -sf -o /dev/null -u "admin:${CURRENT_ADMIN_PASSWORD}" "${NEXUS_URL}/service/rest/v1/security/roles/${ROLE_ID}"; then
+    echo "[nexus-init] role ${ROLE_ID} already exists, skipping."
+  else
+    curl -sf -X POST \
+      -H 'Content-Type: application/json' \
+      -u "admin:${CURRENT_ADMIN_PASSWORD}" \
+      -d "{\"id\":\"${ROLE_ID}\",\"name\":\"${ROLE_ID}\",\"description\":\"cambium dev stack synthetic role\",\"privileges\":[],\"roles\":[]}" \
+      "${NEXUS_URL}/service/rest/v1/security/roles"
+    echo "[nexus-init] role ${ROLE_ID} created."
+  fi
+done
+
 echo "[nexus-init] checking for an existing rutauth capability ..."
 EXISTING_ID="$(curl -sf -u "admin:${CURRENT_ADMIN_PASSWORD}" "${NEXUS_URL}/service/rest/v1/capabilities" \
   | jq -r '.[] | select(.type == "rutauth") | .id' | head -1)"

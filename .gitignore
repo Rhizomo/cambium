@@ -2,3 +2,7 @@
 .env
 *.log
 .DS_Store
+
+# Private/internal deployment notes, not for the public repo — kept locally only
+/docs/cutover-plan.md
+/docs/load-test-results.md

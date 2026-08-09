@@ -2,9 +2,8 @@
 # `ropc-proxy` subcommand ship in this one image — same binary, different
 # CMD). Matches the structure of `grafter`'s Dockerfile (deps cached
 # separately from source) but built from stock Docker Hub images rather than
-# Smartech's internal registry mirror, since this image is meant to be
-# buildable by anyone cloning this repo, not just from inside Smartech's
-# network.
+# any private registry mirror, since this image is meant to be buildable by
+# anyone cloning this repo, not just from inside one specific network.
 FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /build

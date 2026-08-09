@@ -1,7 +1,7 @@
 //! Nexus Repository 3 REST API client (`/service/rest/v1/security/*`).
 //!
 //! Behavior below was verified live against a disposable local
-//! `sonatype/nexus3:latest` container (never against any Smartech-managed
+//! `sonatype/nexus3:latest` container (never against any private/production
 //! Nexus instance) — see `docs/sync-semantics.md` section 1 for the full
 //! writeup. The load-bearing facts baked into this client:
 //!

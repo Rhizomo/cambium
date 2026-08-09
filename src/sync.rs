@@ -2,13 +2,14 @@
 //! User/Role assignments, applying the clobber-avoidance semantics
 //! documented in `docs/sync-semantics.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
+use async_trait::async_trait;
 use tracing::{info, warn};
 
 use crate::error::{CambiumError, CambiumResult};
-use crate::keycloak::KeycloakClient;
+use crate::keycloak::{KcGroup, KcUser, KeycloakClient};
 use crate::manifest::Manifest;
 use crate::nexus::{NewNexusUser, NexusClient};
 
@@ -72,15 +73,98 @@ pub fn map_to_nexus_roles(
         .collect()
 }
 
-/// One full reconciliation pass: Keycloak groups -> members -> effective
-/// roles -> Nexus.
+/// Folds a batch of `KcUser`s into the running discovery set, keyed by
+/// Keycloak user id so a user found via both group membership and a direct
+/// role assignment is one entry, not two.
+fn merge_users(members: &mut HashMap<String, String>, users: Vec<KcUser>) {
+    for u in users {
+        members.insert(u.id, u.username);
+    }
+}
+
+/// Abstracts the two group-tree calls `discover_group_tree_members` needs,
+/// so the recursive-traversal logic can be unit tested against an in-memory
+/// fake tree instead of a live Keycloak server — same pattern as
+/// `ropc::TokenExchanger`.
+#[async_trait]
+trait GroupTreeSource: Send + Sync {
+    async fn children(&self, group_id: &str) -> CambiumResult<Vec<KcGroup>>;
+    async fn members(&self, group_id: &str) -> CambiumResult<Vec<KcUser>>;
+}
+
+struct LiveGroupTree<'a> {
+    kc: &'a KeycloakClient,
+    realm: &'a str,
+}
+
+#[async_trait]
+impl GroupTreeSource for LiveGroupTree<'_> {
+    async fn children(&self, group_id: &str) -> CambiumResult<Vec<KcGroup>> {
+        self.kc.group_children(self.realm, group_id).await
+    }
+
+    async fn members(&self, group_id: &str) -> CambiumResult<Vec<KcUser>> {
+        self.kc.group_members(self.realm, group_id).await
+    }
+}
+
+/// Breadth-first walk of every top-level group and all of its descendant
+/// subgroups, to arbitrary nesting depth, unioning every group's and
+/// subgroup's direct members into one discovery set via `merge_users`.
+/// Keycloak's `GET /groups/{id}/children` (see `KeycloakClient::group_children`)
+/// only returns *immediate* children, so nested subgroups-of-subgroups need
+/// repeated calls — this is that repetition.
 ///
-/// v1 scoping decision: only users who are a direct member of *some*
-/// Keycloak group in the realm are considered, matching ARCHITECTURE.md's
-/// framing ("reads Keycloak group membership") and avoiding a full-realm
-/// user dump. A user with realm roles assigned directly but no group
-/// membership at all is out of scope for v1 — noted as a known limitation,
-/// not silently unhandled.
+/// `seen` guards against revisiting a group id: Keycloak's own group model
+/// doesn't allow a group to be its own ancestor, so a cycle should never
+/// occur in practice, but nothing here should hang forever on a malformed or
+/// unexpected response, so each group is fetched at most once regardless.
+async fn discover_group_tree_members<S: GroupTreeSource>(
+    source: &S,
+    top_level_groups: &[KcGroup],
+) -> CambiumResult<HashMap<String, String>> {
+    let mut members = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut queue: VecDeque<KcGroup> = top_level_groups.iter().cloned().collect();
+
+    while let Some(group) = queue.pop_front() {
+        if !seen.insert(group.id.clone()) {
+            continue;
+        }
+
+        let group_members = source.members(&group.id).await?;
+        merge_users(&mut members, group_members);
+
+        let children = source.children(&group.id).await?;
+        queue.extend(children);
+    }
+
+    Ok(members)
+}
+
+/// One full reconciliation pass: Keycloak groups (recursively, including all
+/// nested subgroups) -> members, unioned with Keycloak roles -> direct role
+/// assignees -> effective roles -> Nexus.
+///
+/// User discovery draws on two complementary Keycloak sources rather than a
+/// full-realm user dump: every group's and subgroup's membership, walked to
+/// arbitrary nesting depth by `discover_group_tree_members`
+/// (`list_groups` + recursive `group_children` + `group_members`), and, for
+/// every Keycloak role name Cambium has a mapping for in `role_map`,
+/// everyone with that role assigned directly
+/// (`users_with_direct_realm_role`). The second source exists because
+/// group-membership traversal alone misses users with a realm role assigned
+/// straight to them and no group membership at all — the classic case is a
+/// service account created with a direct role grant and never put in a
+/// group — see `docs/sync-semantics.md` section 2. The recursive part of the
+/// first source exists because `GET /groups` only returns top-level groups
+/// with an always-empty `subGroups` array — a user belonging only to a
+/// subgroup (at any nesting depth) is otherwise invisible to discovery, even
+/// though `effective_realm_roles` would resolve their inherited role
+/// correctly if they were ever found — see `docs/sync-semantics.md` section
+/// 2. Once a user is discovered by either path,
+/// `effective_realm_roles` below recomputes their full direct-or-inherited
+/// role set anyway, so which path found them doesn't affect the outcome.
 pub async fn run_pass(
     kc: &KeycloakClient,
     nexus: &NexusClient,
@@ -91,17 +175,37 @@ pub async fn run_pass(
     state_file: &Path,
 ) -> CambiumResult<()> {
     let groups = kc.list_groups(kc_realm).await?;
-    info!(count = groups.len(), "fetched Keycloak groups");
+    info!(count = groups.len(), "fetched top-level Keycloak groups");
 
-    // Union of (user_id -> username) across every group's membership.
-    let mut members: HashMap<String, String> = HashMap::new();
-    for group in &groups {
-        let group_members = kc.group_members(kc_realm, &group.id).await?;
-        for u in group_members {
-            members.insert(u.id, u.username);
+    let tree = LiveGroupTree {
+        kc,
+        realm: kc_realm,
+    };
+    let mut members = discover_group_tree_members(&tree, &groups).await?;
+    info!(
+        count = members.len(),
+        "distinct users across all groups and subgroups"
+    );
+
+    for role_name in role_map.keys() {
+        match kc.users_with_direct_realm_role(kc_realm, role_name).await {
+            Ok(direct_users) => merge_users(&mut members, direct_users),
+            // Operator typo'd ROLE_MAP, or the role was deleted in Keycloak
+            // after ROLE_MAP was written — neither invalidates the rest of
+            // this pass, so treat it as "nobody has this role directly" and
+            // keep going, same fail-soft posture as the per-user loop below.
+            Err(CambiumError::NotFound) => {
+                warn!(role_name, "keycloak realm role from ROLE_MAP does not exist; skipping direct-assignment lookup for it");
+            }
+            Err(e) => {
+                warn!(role_name, error = %e, "failed to fetch direct role assignees, continuing with next role");
+            }
         }
     }
-    info!(count = members.len(), "distinct users across all groups");
+    info!(
+        count = members.len(),
+        "distinct users across groups and direct role assignments"
+    );
 
     for (user_id, username) in members {
         match sync_one_user(
@@ -175,7 +279,7 @@ async fn sync_one_user(
                     user_id: username.to_string(),
                     first_name: username.to_string(),
                     last_name: "(cambium)".to_string(),
-                    email_address: format!("{username}@{fallback_email_domain}"),
+                    email_address: resolve_email_address(username, fallback_email_domain),
                     // RutAuth means Nexus's own local password is never
                     // actually used to authenticate — Keycloak (via the
                     // OIDC proxy) is the real authentication path. This is
@@ -215,6 +319,25 @@ async fn sync_one_user(
     Ok(())
 }
 
+/// Keycloak usernames are operator-configured and, on at least one real
+/// deployment observed, are already the user's full email address (not a
+/// bare handle) — confirmed live: `FALLBACK_EMAIL_DOMAIN` blindly appended
+/// to a username like `alice@example.com` produced `alice@example.com@cambium.invalid`,
+/// which Nexus's `POST /v1/security/users` rejects outright
+/// (`PARAMETER emailAddress: must be a well-formed email address`), so this
+/// isn't a cosmetic issue — it silently failed every single user on a realm
+/// where usernames are emails. If `username` already looks like an email
+/// (contains exactly one `@` with non-empty text on both sides), use it
+/// as-is; only synthesize `{username}@{fallback_email_domain}` for realms
+/// where usernames are bare handles, matching the local dev stack's
+/// `user-alpha-1`-style names.
+fn resolve_email_address(username: &str, fallback_email_domain: &str) -> String {
+    match username.split_once('@') {
+        Some((local, domain)) if !local.is_empty() && !domain.is_empty() => username.to_string(),
+        _ => format!("{username}@{fallback_email_domain}"),
+    }
+}
+
 /// A placeholder Nexus local-account password, generated only because
 /// `POST /v1/security/users` requires *some* value in the field. RutAuth is
 /// the actual authentication path (see `ARCHITECTURE.md`) — this password is
@@ -236,6 +359,39 @@ mod tests {
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Real-realm regression: confirmed live against a Keycloak realm where
+    /// usernames are full emails — appending a fallback domain must not
+    /// happen when the username is already a well-formed email.
+    #[test]
+    fn resolve_email_address_uses_username_as_is_when_already_an_email() {
+        assert_eq!(
+            resolve_email_address("alice@example.com", "cambium.invalid"),
+            "alice@example.com"
+        );
+    }
+
+    #[test]
+    fn resolve_email_address_appends_fallback_domain_for_bare_usernames() {
+        assert_eq!(
+            resolve_email_address("user-alpha-1", "cambium.invalid"),
+            "user-alpha-1@cambium.invalid"
+        );
+    }
+
+    #[test]
+    fn resolve_email_address_treats_leading_or_trailing_at_as_not_an_email() {
+        // "@example.com" and "alice@" are not valid emails either way — fall
+        // back rather than producing something equally malformed.
+        assert_eq!(
+            resolve_email_address("@example.com", "cambium.invalid"),
+            "@example.com@cambium.invalid"
+        );
+        assert_eq!(
+            resolve_email_address("alice@", "cambium.invalid"),
+            "alice@@cambium.invalid"
+        );
     }
 
     #[test]
@@ -364,6 +520,183 @@ mod tests {
         let role_map = HashMap::new();
         let mapped = map_to_nexus_roles(&set(&[]), &role_map);
         assert!(mapped.is_empty());
+    }
+
+    fn kc_user(id: &str, username: &str) -> KcUser {
+        KcUser {
+            id: id.to_string(),
+            username: username.to_string(),
+            email: None,
+            enabled: None,
+        }
+    }
+
+    fn kc_group(id: &str, path: &str) -> KcGroup {
+        KcGroup {
+            id: id.to_string(),
+            name: path.trim_start_matches('/').to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    /// In-memory `GroupTreeSource` fake keyed by group id, so
+    /// `discover_group_tree_members` can be exercised without a live
+    /// Keycloak server — same style as `ropc`'s fake `TokenExchanger`.
+    #[derive(Default)]
+    struct FakeGroupTree {
+        children: HashMap<String, Vec<KcGroup>>,
+        members: HashMap<String, Vec<KcUser>>,
+    }
+
+    #[async_trait]
+    impl GroupTreeSource for FakeGroupTree {
+        async fn children(&self, group_id: &str) -> CambiumResult<Vec<KcGroup>> {
+            Ok(self.children.get(group_id).cloned().unwrap_or_default())
+        }
+
+        async fn members(&self, group_id: &str) -> CambiumResult<Vec<KcUser>> {
+            Ok(self.members.get(group_id).cloned().unwrap_or_default())
+        }
+    }
+
+    /// The subgroup-discovery fix: a user who belongs only to a subgroup
+    /// (never the parent directly) must still show up once the parent is
+    /// walked recursively — this is exactly the `/team-gamma/team-gamma-leads`
+    /// case from the dev stack (`dev/keycloak/realm-export.json`).
+    #[tokio::test]
+    async fn discover_group_tree_members_finds_a_user_in_a_direct_subgroup() {
+        let mut tree = FakeGroupTree::default();
+        tree.children.insert(
+            "team-gamma".to_string(),
+            vec![kc_group("team-gamma-leads", "/team-gamma/team-gamma-leads")],
+        );
+        tree.members.insert(
+            "team-gamma-leads".to_string(),
+            vec![kc_user("u1", "user-gamma-lead-1")],
+        );
+
+        let top_level = vec![kc_group("team-gamma", "/team-gamma")];
+        let members = discover_group_tree_members(&tree, &top_level)
+            .await
+            .expect("traversal must not fail against a well-formed fake tree");
+
+        assert_eq!(
+            members.get("u1").map(String::as_str),
+            Some("user-gamma-lead-1")
+        );
+    }
+
+    /// Keycloak allows arbitrary nesting, not just one level of subgroups —
+    /// this must keep walking past a grandchild.
+    #[tokio::test]
+    async fn discover_group_tree_members_walks_multiple_nesting_levels() {
+        let mut tree = FakeGroupTree::default();
+        tree.children.insert(
+            "root".to_string(),
+            vec![kc_group("child", "/root/child")],
+        );
+        tree.children.insert(
+            "child".to_string(),
+            vec![kc_group("grandchild", "/root/child/grandchild")],
+        );
+        tree.members.insert(
+            "grandchild".to_string(),
+            vec![kc_user("u1", "deeply-nested-user")],
+        );
+
+        let top_level = vec![kc_group("root", "/root")];
+        let members = discover_group_tree_members(&tree, &top_level)
+            .await
+            .expect("traversal must not fail against a well-formed fake tree");
+
+        assert_eq!(
+            members.get("u1").map(String::as_str),
+            Some("deeply-nested-user")
+        );
+    }
+
+    /// A user in both a parent and one of its subgroups must be deduplicated
+    /// to a single entry, same guarantee `merge_users` already gives the
+    /// group/direct-role overlap case.
+    #[tokio::test]
+    async fn discover_group_tree_members_deduplicates_across_parent_and_subgroup() {
+        let mut tree = FakeGroupTree::default();
+        tree.children.insert(
+            "parent".to_string(),
+            vec![kc_group("child", "/parent/child")],
+        );
+        tree.members
+            .insert("parent".to_string(), vec![kc_user("u1", "alice")]);
+        tree.members
+            .insert("child".to_string(), vec![kc_user("u1", "alice")]);
+
+        let top_level = vec![kc_group("parent", "/parent")];
+        let members = discover_group_tree_members(&tree, &top_level)
+            .await
+            .expect("traversal must not fail against a well-formed fake tree");
+
+        assert_eq!(members.len(), 1);
+        assert_eq!(members.get("u1").map(String::as_str), Some("alice"));
+    }
+
+    /// Defensive cycle guard: Keycloak shouldn't ever hand back a group that
+    /// lists itself (or an ancestor) as a child, but the traversal must
+    /// terminate instead of looping forever if it ever did.
+    #[tokio::test]
+    async fn discover_group_tree_members_terminates_on_a_self_referential_cycle() {
+        let mut tree = FakeGroupTree::default();
+        tree.children.insert(
+            "cyclic".to_string(),
+            vec![kc_group("cyclic", "/cyclic")],
+        );
+        tree.members
+            .insert("cyclic".to_string(), vec![kc_user("u1", "alice")]);
+
+        let top_level = vec![kc_group("cyclic", "/cyclic")];
+        let members = discover_group_tree_members(&tree, &top_level)
+            .await
+            .expect("traversal must not fail against a well-formed fake tree");
+
+        assert_eq!(members.len(), 1);
+    }
+
+    /// The direct-role-only discovery fix: a user found only via
+    /// `users_with_direct_realm_role` (no group membership at all) must end
+    /// up in the same discovery set `run_pass` reconciles, not a
+    /// second-class one.
+    #[test]
+    fn merge_users_adds_a_user_with_no_group_membership() {
+        let mut members = HashMap::new();
+        merge_users(&mut members, vec![kc_user("g1", "alice")]);
+        merge_users(&mut members, vec![kc_user("r1", "svc-example")]);
+
+        assert_eq!(members.get("g1").map(String::as_str), Some("alice"));
+        assert_eq!(
+            members.get("r1").map(String::as_str),
+            Some("svc-example")
+        );
+        assert_eq!(members.len(), 2);
+    }
+
+    /// A user who is both a group member *and* has a role assigned directly
+    /// must be deduplicated to one entry, keyed by Keycloak user id — the
+    /// two discovery sources are meant to overlap for most users, not
+    /// double-process them.
+    #[test]
+    fn merge_users_deduplicates_overlap_between_group_and_direct_role_discovery() {
+        let mut members = HashMap::new();
+        merge_users(&mut members, vec![kc_user("u1", "bob")]);
+        merge_users(&mut members, vec![kc_user("u1", "bob")]);
+
+        assert_eq!(members.len(), 1);
+        assert_eq!(members.get("u1").map(String::as_str), Some("bob"));
+    }
+
+    #[test]
+    fn merge_users_handles_empty_batch() {
+        let mut members: HashMap<String, String> = HashMap::new();
+        merge_users(&mut members, vec![]);
+        assert!(members.is_empty());
     }
 
     /// Regression test for the "batch dies mid-loop" bug: `run_pass` used to

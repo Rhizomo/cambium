@@ -1,7 +1,7 @@
 # Local end-to-end dev stack for Cambium: Keycloak + a vanilla Nexus3 CE +
 # both Cambium subcommands, wired together so the whole
 # Keycloak-group -> Nexus-role / RutAuth-header path can actually be
-# exercised on a laptop. Never points at anything Smartech-internal --
+# exercised on a laptop. Never points at any private/internal system --
 # every image here is a stock upstream image (Keycloak's own quay.io image,
 # Sonatype's own Docker Hub image), and this repo's own Dockerfile.
 #
@@ -71,7 +71,7 @@ services:
       NEXUS_URL: http://nexus:8081
       NEXUS_USERNAME: admin
       NEXUS_PASSWORD: admin123
-      ROLE_MAP: "nexus-admin:nx-admin"
+      ROLE_MAP: "nexus-admin:nx-admin,role-viewer:nx-viewer,role-editor:nx-editor,role-publisher:nx-publisher,role-auditor:nx-auditor,role-ops:nx-ops,role-billing:nx-billing,role-superuser:nx-superuser"
       POLL_INTERVAL_SECONDS: "30"
       STATE_FILE: /var/lib/cambium/state.json
       LOCK_FILE: /var/lib/cambium/cambium.lock
