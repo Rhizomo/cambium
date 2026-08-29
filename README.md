@@ -1,5 +1,7 @@
 # Cambium
 
+[![CI](https://github.com/Rhizomo/cambium/actions/workflows/ci.yml/badge.svg)](https://github.com/Rhizomo/cambium/actions/workflows/ci.yml)
+
 An OIDC/Keycloak translator for [Sonatype Nexus Repository 3](https://www.sonatype.com/products/sonatype-nexus-repository) (Community Edition). Nexus 3 has no native OIDC support and the one prior community plugin (`flytreeleft/nexus3-keycloak-plugin`) has been archived since 2021. Cambium closes the gap without touching Nexus's own code — no custom auth realm, no jar patching, no classloading tricks.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design and why this approach was chosen over writing a custom Shiro `Realm`.
