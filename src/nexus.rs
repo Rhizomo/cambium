@@ -65,7 +65,7 @@ pub struct NexusClient {
 impl NexusClient {
     pub fn new(base_url: impl Into<String>, username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::api_client(),
             base_url: base_url.into(),
             username: username.into(),
             password: password.into(),

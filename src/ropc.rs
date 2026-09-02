@@ -172,7 +172,7 @@ pub struct KeycloakTokenExchanger {
 impl KeycloakTokenExchanger {
     pub fn new(issuer: impl Into<String>, client_id: impl Into<String>, client_secret: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::api_client(),
             issuer: issuer.into(),
             client_id: client_id.into(),
             client_secret: client_secret.into(),
@@ -622,7 +622,7 @@ pub async fn run(config: RopcConfig) -> anyhow::Result<()> {
         identity_claim: config.identity_claim,
         rutauth_header,
         nexus_upstream: config.nexus_upstream,
-        http: reqwest::Client::new(),
+        http: crate::http::streaming_client(),
         requests_handled: AtomicU64::new(0),
     });
 
@@ -1093,7 +1093,9 @@ mod tests {
             identity_claim: "preferred_username".to_string(),
             rutauth_header: HeaderName::from_static("x-forwarded-user"),
             nexus_upstream: nexus_upstream.to_string(),
-            http: reqwest::Client::new(),
+            // Same construction as `run()`, so the test path exercises the
+            // real timeout config rather than an untimed client.
+            http: crate::http::streaming_client(),
             requests_handled: AtomicU64::new(0),
         })
     }

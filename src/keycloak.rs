@@ -81,7 +81,7 @@ impl KeycloakClient {
         client_secret: impl Into<String>,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::api_client(),
             admin_url: admin_url.into(),
             admin_realm: admin_realm.into(),
             client_id: client_id.into(),

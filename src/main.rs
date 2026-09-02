@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod http;
 mod keycloak;
 mod lock;
 mod manifest;
