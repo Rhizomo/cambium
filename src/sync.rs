@@ -73,12 +73,34 @@ pub fn map_to_nexus_roles(
         .collect()
 }
 
+/// A user discovered by either source, carrying everything the
+/// reconciliation decision needs. `enabled` is load-bearing: a user disabled
+/// in Keycloak must have their Cambium-granted Nexus roles revoked, so the
+/// flag has to survive discovery rather than being dropped here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredUser {
+    pub username: String,
+    pub enabled: bool,
+}
+
 /// Folds a batch of `KcUser`s into the running discovery set, keyed by
 /// Keycloak user id so a user found via both group membership and a direct
 /// role assignment is one entry, not two.
-fn merge_users(members: &mut HashMap<String, String>, users: Vec<KcUser>) {
+///
+/// A `KcUser` with no `enabled` field at all is treated as enabled. Keycloak
+/// always sends it on a `UserRepresentation`, so this only covers a response
+/// shape Keycloak doesn't currently produce — and defaulting the other way
+/// would mass-revoke every user in the realm the first time an upgrade
+/// changed that. Only an explicit `"enabled": false` revokes.
+fn merge_users(members: &mut HashMap<String, DiscoveredUser>, users: Vec<KcUser>) {
     for u in users {
-        members.insert(u.id, u.username);
+        members.insert(
+            u.id,
+            DiscoveredUser {
+                username: u.username,
+                enabled: u.enabled.unwrap_or(true),
+            },
+        );
     }
 }
 
@@ -122,7 +144,7 @@ impl GroupTreeSource for LiveGroupTree<'_> {
 async fn discover_group_tree_members<S: GroupTreeSource>(
     source: &S,
     top_level_groups: &[KcGroup],
-) -> CambiumResult<HashMap<String, String>> {
+) -> CambiumResult<HashMap<String, DiscoveredUser>> {
     let mut members = HashMap::new();
     let mut seen = HashSet::new();
     let mut queue: VecDeque<KcGroup> = top_level_groups.iter().cloned().collect();
@@ -207,13 +229,15 @@ pub async fn run_pass(
         "distinct users across groups and direct role assignments"
     );
 
-    for (user_id, username) in members {
+    for (user_id, user) in members {
+        let username = user.username.as_str();
         match sync_one_user(
             kc,
             nexus,
             kc_realm,
             &user_id,
-            &username,
+            username,
+            user.enabled,
             role_map,
             manifest,
             fallback_email_domain,
@@ -256,12 +280,26 @@ async fn sync_one_user(
     kc_realm: &str,
     kc_user_id: &str,
     username: &str,
+    enabled: bool,
     role_map: &HashMap<String, String>,
     manifest: &mut Manifest,
     fallback_email_domain: &str,
 ) -> CambiumResult<()> {
-    let effective = kc.effective_realm_roles(kc_realm, kc_user_id).await?;
-    let desired_managed_roles = map_to_nexus_roles(&effective, role_map);
+    // A user disabled in Keycloak justifies nothing. Resolving to an empty
+    // desired set (rather than skipping the user) is what makes this a
+    // *revocation*: `reconcile_roles` below removes exactly the roles Cambium
+    // granted last pass and leaves anything an admin assigned by hand alone,
+    // the same clobber-avoidance contract every other path here honors.
+    //
+    // Deliberately does not force Nexus's `status` to `disabled`: Cambium
+    // only ever undoes what Cambium did, and the account may predate it or be
+    // shared with another realm. See docs/sync-semantics.md.
+    let desired_managed_roles = if enabled {
+        let effective = kc.effective_realm_roles(kc_realm, kc_user_id).await?;
+        map_to_nexus_roles(&effective, role_map)
+    } else {
+        HashSet::new()
+    };
     let last_synced_roles = manifest.last_synced(kc_realm, username);
 
     let existing = nexus.get_user(username).await?;
@@ -300,6 +338,13 @@ async fn sync_one_user(
         }
         Some(current) => {
             let current_nexus_roles: HashSet<String> = current.roles.iter().cloned().collect();
+            if !enabled && !last_synced_roles.is_empty() {
+                info!(
+                    username,
+                    revoking = ?last_synced_roles,
+                    "user is disabled in Keycloak, revoking the roles Cambium granted"
+                );
+            }
             let outcome = reconcile_roles(&ReconcileInput {
                 desired_managed_roles: desired_managed_roles.clone(),
                 last_synced_roles,
@@ -527,8 +572,19 @@ mod tests {
             id: id.to_string(),
             username: username.to_string(),
             email: None,
-            enabled: None,
+            enabled: Some(true),
         }
+    }
+
+    fn kc_user_disabled(id: &str, username: &str) -> KcUser {
+        KcUser {
+            enabled: Some(false),
+            ..kc_user(id, username)
+        }
+    }
+
+    fn username_of(members: &HashMap<String, DiscoveredUser>, id: &str) -> Option<String> {
+        members.get(id).map(|u| u.username.clone())
     }
 
     fn kc_group(id: &str, path: &str) -> KcGroup {
@@ -581,7 +637,7 @@ mod tests {
             .expect("traversal must not fail against a well-formed fake tree");
 
         assert_eq!(
-            members.get("u1").map(String::as_str),
+            username_of(&members, "u1").as_deref(),
             Some("user-gamma-lead-1")
         );
     }
@@ -610,7 +666,7 @@ mod tests {
             .expect("traversal must not fail against a well-formed fake tree");
 
         assert_eq!(
-            members.get("u1").map(String::as_str),
+            username_of(&members, "u1").as_deref(),
             Some("deeply-nested-user")
         );
     }
@@ -636,7 +692,7 @@ mod tests {
             .expect("traversal must not fail against a well-formed fake tree");
 
         assert_eq!(members.len(), 1);
-        assert_eq!(members.get("u1").map(String::as_str), Some("alice"));
+        assert_eq!(username_of(&members, "u1").as_deref(), Some("alice"));
     }
 
     /// Defensive cycle guard: Keycloak shouldn't ever hand back a group that
@@ -670,11 +726,8 @@ mod tests {
         merge_users(&mut members, vec![kc_user("g1", "alice")]);
         merge_users(&mut members, vec![kc_user("r1", "svc-example")]);
 
-        assert_eq!(members.get("g1").map(String::as_str), Some("alice"));
-        assert_eq!(
-            members.get("r1").map(String::as_str),
-            Some("svc-example")
-        );
+        assert_eq!(username_of(&members, "g1").as_deref(), Some("alice"));
+        assert_eq!(username_of(&members, "r1").as_deref(), Some("svc-example"));
         assert_eq!(members.len(), 2);
     }
 
@@ -689,14 +742,62 @@ mod tests {
         merge_users(&mut members, vec![kc_user("u1", "bob")]);
 
         assert_eq!(members.len(), 1);
-        assert_eq!(members.get("u1").map(String::as_str), Some("bob"));
+        assert_eq!(username_of(&members, "u1").as_deref(), Some("bob"));
     }
 
     #[test]
     fn merge_users_handles_empty_batch() {
-        let mut members: HashMap<String, String> = HashMap::new();
+        let mut members: HashMap<String, DiscoveredUser> = HashMap::new();
         merge_users(&mut members, vec![]);
         assert!(members.is_empty());
+    }
+
+    /// The `enabled` flag has to survive discovery — it used to be parsed off
+    /// the wire and then dropped here, which is what let a user disabled in
+    /// Keycloak keep their Nexus roles indefinitely.
+    #[test]
+    fn merge_users_carries_the_disabled_flag_through_discovery() {
+        let mut members = HashMap::new();
+        merge_users(
+            &mut members,
+            vec![kc_user("u1", "alice"), kc_user_disabled("u2", "bob")],
+        );
+
+        assert!(members.get("u1").unwrap().enabled);
+        assert!(!members.get("u2").unwrap().enabled);
+    }
+
+    /// A missing `enabled` field means enabled. Defaulting the other way
+    /// would mass-revoke the entire realm the first time a Keycloak upgrade
+    /// changed the response shape.
+    #[test]
+    fn merge_users_treats_a_missing_enabled_field_as_enabled() {
+        let mut members = HashMap::new();
+        merge_users(
+            &mut members,
+            vec![KcUser {
+                enabled: None,
+                ..kc_user("u1", "alice")
+            }],
+        );
+
+        assert!(members.get("u1").unwrap().enabled);
+    }
+
+    /// The revocation half of the disabled-user fix: resolving a disabled
+    /// user to an empty desired set must remove exactly what Cambium granted
+    /// and leave a manually-assigned role untouched, same contract as every
+    /// other path.
+    #[test]
+    fn disabled_user_resolves_to_revoking_only_cambium_granted_roles() {
+        let outcome = reconcile_roles(&ReconcileInput {
+            desired_managed_roles: HashSet::new(),
+            last_synced_roles: ["nx-developer".to_string()].into(),
+            current_nexus_roles: ["nx-developer".to_string(), "nx-manual".to_string()].into(),
+        });
+
+        assert!(outcome.changed);
+        assert_eq!(outcome.new_roles, ["nx-manual".to_string()].into());
     }
 
     /// Regression test for the "batch dies mid-loop" bug: `run_pass` used to

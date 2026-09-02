@@ -45,8 +45,9 @@ pub struct KcUser {
     #[serde(default)]
     #[allow(dead_code)]
     pub email: Option<String>,
+    /// `None` only if Keycloak omits the field entirely; `merge_users` in
+    /// `src/sync.rs` treats that as enabled. An explicit `false` revokes.
     #[serde(default)]
-    #[allow(dead_code)]
     pub enabled: Option<bool>,
 }
 

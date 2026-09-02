@@ -116,6 +116,7 @@
 
     { "username": "user-gamma-lead-1", "enabled": true, "email": "user-gamma-lead-1@example.com", "firstName": "GammaLead", "lastName": "One", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-gamma/team-gamma-leads"] },
     { "username": "user-gamma-lead-2", "enabled": true, "email": "user-gamma-lead-2@example.com", "firstName": "GammaLead", "lastName": "Two", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-gamma/team-gamma-leads"] },
+    { "username": "user-gamma-disabled", "enabled": false, "email": "user-gamma-disabled@example.com", "firstName": "Gamma", "lastName": "Disabled", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-gamma"] },
 
     { "username": "user-delta-1", "enabled": true, "email": "user-delta-1@example.com", "firstName": "Delta", "lastName": "One", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-delta"] },
     { "username": "user-delta-2", "enabled": true, "email": "user-delta-2@example.com", "firstName": "Delta", "lastName": "Two", "credentials": [{ "type": "password", "value": "dev-password", "temporary": false }], "groups": ["/team-delta"] },
