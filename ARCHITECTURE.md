@@ -41,6 +41,34 @@ That means Nexus already knows how to trust an externally-authenticated identity
                       └─────────────────────────────────────────┘
 ```
 
+### The requirement this creates
+
+Trusting a header means trusting *everything that can set it*. `RutAuthRealm`
+performs no verification beyond the header's presence — no signature, no
+shared secret, no source-address check — and the capability has exactly one
+configurable field, the header name. So a request that reaches Nexus's port
+directly, carrying that header, is authenticated as whoever it names:
+
+```
+curl -H 'X-Forwarded-User: admin' http://nexus:8081/service/rest/v1/security/users
+```
+
+Verified live against this repo's own dev stack: that returns `200` as Nexus's
+built-in `admin`, with no proxy involved. Sonatype documents the same
+constraint for their Apache reference setup — *"Without this restriction a
+user could bypass the Apache instance and log directly into Nexus, or worse,
+they could craft a malicious request with the remote user header set and gain
+access to resource."*
+
+**Therefore Nexus's port MUST be reachable only from the proxy** — Kubernetes
+`NetworkPolicy`, a firewall rule, a `localhost`-only listener, or same-pod
+co-location. This is a deployment requirement, not something Cambium can
+enforce in code, and it is the assumption the entire design rests on. Related
+guarantees the operator also owns (identity-claim uniqueness, Keycloak
+username collisions with Nexus's built-in accounts, Keycloak group-admin being
+equivalent to Nexus admin) are set out in
+[THREAT_MODEL.md](./THREAT_MODEL.md) §1-2.
+
 RutAuth only solves **authentication** (who is this). It says nothing about **authorization** (what can they do) — Nexus still needs real `User`/`Role` records with privileges attached, exactly as it does today for any locally-managed user. That's the actual gap Cambium fills: a small, focused sync tool, not a full auth realm.
 
 ## Components

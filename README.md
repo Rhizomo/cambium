@@ -12,6 +12,17 @@ v1 role-sync daemon implemented. See [docs/sync-semantics.md](./docs/sync-semant
 
 v1 ROPC-to-header-injection CLI proxy implemented (`cambium ropc-proxy`). See [docs/oidc-proxy-pairing.md](./docs/oidc-proxy-pairing.md) for the full design — why `oauth2-proxy`/Envoy can't do this, the exact request flow, config shape, caching behavior, and the security mitigations (this is a deprecated OAuth grant type per RFC 9700; the doc is explicit about what this shim does and doesn't fix).
 
+> **Nexus must be unreachable except through the proxy.** `RutAuthRealm`
+> treats the configured header as an already-authenticated principal and
+> verifies nothing else — no signature, no shared secret, no source-address
+> check. Anyone who can reach Nexus's port directly with that header set *is*
+> that user, including Nexus's built-in `admin`. Restrict the port at the
+> network layer (Kubernetes `NetworkPolicy`, firewall rule, `localhost`-only
+> listener, or same-pod co-location) so the proxy is the only path in.
+> This is a deployment requirement Cambium cannot enforce for you, and it is
+> the single assumption the whole architecture rests on. See
+> [THREAT_MODEL.md](./THREAT_MODEL.md) §2.1.
+
 > **Run exactly one instance.** Cambium's sync manifest is a plain JSON file with no internal locking. v1 enforces this at startup with an OS-level `flock` (`LOCK_FILE`, default `/var/lib/cambium/cambium.lock`) — a second instance pointed at the same lock file refuses to start rather than racing on the manifest. Do not scale this deployment beyond `replicas: 1`. See [docs/sync-semantics.md](./docs/sync-semantics.md) for why.
 
 ## Subcommands
@@ -24,6 +35,14 @@ v1 ROPC-to-header-injection CLI proxy implemented (`cambium ropc-proxy`). See [d
 ## The short version
 
 Nexus CE already ships a built-in, free capability called `RutAuthRealm` that trusts an HTTP header as an already-authenticated principal. Pair that with a real OIDC proxy in front of Nexus (handles the actual Keycloak login), and the only genuinely missing piece is keeping Nexus's own user/role assignments in sync with Keycloak group membership. That sync tool is what Cambium actually is.
+
+## Security
+
+Trust boundaries, deployment requirements, and known non-goals:
+[THREAT_MODEL.md](./THREAT_MODEL.md).
+
+Vulnerability reports: _(reporting address TBD — to be filled in before this
+repo is publicised; until then, open a private security advisory on GitHub.)_
 
 ## License
 

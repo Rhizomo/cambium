@@ -52,10 +52,24 @@ exchange → `preferred_username` claim extracted → injected as
 `X-Forwarded-User` → forwarded to Nexus (`localhost:8081`) → Nexus's
 `RutAuthRealm` trusts the header → authorization checked against the Nexus
 `User` record Cambium's sync daemon created moments earlier from `alice`'s
-Keycloak group membership. A request to the same URL with no credentials,
-or straight to `localhost:8081` bypassing the proxy, gets a `401` — RutAuth
-only trusts the header when a proxy that's supposed to authenticate first,
-authenticated first.
+Keycloak group membership. A request to the same URL with no credentials gets
+a `401`.
+
+**A request straight to `localhost:8081` does not.** Once the `rutauth`
+capability is enabled — which `dev/nexus-init/init.sh` does — Nexus trusts the
+configured header from whatever reaches its port, with no way to know whether
+a proxy authenticated first. In this stack, verified live:
+
+```
+curl -H 'X-Forwarded-User: alice' http://localhost:8081/service/rest/v1/security/users   # 200, as alice (nx-admin)
+curl -H 'X-Forwarded-User: admin' http://localhost:8081/service/rest/v1/security/users   # 200, as Nexus's built-in admin
+```
+
+That is RutAuth working as designed, not a bug in the dev stack — and it is
+why the production deployment requirement is that Nexus's port be reachable
+only from the proxy. See [THREAT_MODEL.md](./THREAT_MODEL.md) §2.1. The dev
+stack publishes `8081` to your laptop deliberately, so you can inspect Nexus
+directly; do not mirror that topology anywhere real.
 
 Tear down (including the Nexus/Keycloak data volumes — start clean next
 time):
