@@ -16,6 +16,7 @@ async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"
 urlencoding = "2"
+url = "2"
 rand = "0.8"
 fs2 = "0.4"
 clap = { version = "4", features = ["derive"] }

@@ -162,7 +162,8 @@ client_id = "nexus-browser"
 client_secret = "<from vault, browser-flow client — separate from the ROPC client>"
 redirect_url = "https://nexus.example.com/oauth2/callback"
 
-upstreams = [ "http://nexus:8081/" ]   # oauth2-proxy IS the reverse proxy — avoids the auth_request header-copy bug
+upstreams = [ "https://nexus:8081/" ]  # oauth2-proxy IS the reverse proxy — avoids the auth_request header-copy bug
+                                       # plaintext here carries the RutAuth identity header in the clear; see the note below
 
 email_domains = [ "*" ]
 cookie_secret = "<32-byte base64, from vault>"
@@ -196,11 +197,26 @@ KEYCLOAK_ISSUER=https://<keycloak-host>/realms/<realm>
 KEYCLOAK_ROPC_CLIENT_ID=nexus-cli
 KEYCLOAK_ROPC_CLIENT_SECRET=<from vault — distinct client from nexus-browser>
 IDENTITY_CLAIM=preferred_username     # must match the same principal space Cambium's sync daemon uses
-NEXUS_UPSTREAM=http://nexus:8081/
+NEXUS_UPSTREAM=https://nexus:8081/
 RUTAUTH_HEADER=X-Forwarded-User        # must match RutAuthCapabilityConfiguration.httpHeader exactly
 CACHE_TTL_SECONDS=60
 LISTEN_ADDR=0.0.0.0:8090
 ```
+
+> **On the `https://` above.** `cambium ropc-proxy` and `cambium sync` both
+> validate `KEYCLOAK_ISSUER`, `NEXUS_UPSTREAM`, `KEYCLOAK_URL` and `NEXUS_URL`
+> at startup and **refuse to start on a plaintext `http://` URL** unless
+> `ALLOW_INSECURE_HTTP=1` is set. This is the "TLS-only end-to-end" mitigation
+> in section 3 made enforceable rather than advisory — earlier revisions of
+> this document mandated TLS in prose and then used `http://` in these very
+> reference configs.
+>
+> The opt-in exists for same-pod loopback and the local dev stack (which sets
+> it in `docker-compose.yml`), where plaintext never leaves the pod or the
+> laptop. Setting it anywhere a hop crosses a network puts a user password, a
+> Keycloak admin token, Nexus admin credentials, or the RutAuth identity
+> header on the wire in the clear. See [THREAT_MODEL.md](../THREAT_MODEL.md)
+> §2.4.
 
 Routing: point `docker`/`npm`/`pip` config at a host or path that resolves to
 `cambium-ropc-gateway:8090` (e.g. `nexus-cli.example.com`, or the same

@@ -71,6 +71,7 @@ services:
       NEXUS_URL: http://nexus:8081
       NEXUS_USERNAME: admin
       NEXUS_PASSWORD: admin123
+      ALLOW_INSECURE_HTTP: "true"
       ROLE_MAP: "nexus-admin:nx-admin,role-viewer:nx-viewer,role-editor:nx-editor,role-publisher:nx-publisher,role-auditor:nx-auditor,role-ops:nx-ops,role-billing:nx-billing,role-superuser:nx-superuser"
       POLL_INTERVAL_SECONDS: "30"
       STATE_FILE: /var/lib/cambium/state.json
@@ -97,6 +98,7 @@ services:
       RUTAUTH_HEADER: X-Forwarded-User
       CACHE_TTL_SECONDS: "60"
       LISTEN_ADDR: 0.0.0.0:8090
+      ALLOW_INSECURE_HTTP: "true"
       RUST_LOG: info
     ports:
       - "8090:8090"

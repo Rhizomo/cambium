@@ -190,16 +190,23 @@ as the architecture that removes the problem, at materially higher cost.
 
 ### 2.4 Plaintext transport is permitted, and the docs contradict themselves
 
-`docs/oidc-proxy-pairing.md:146` lists **"TLS-only end-to-end"** as a required
-mitigation. Nothing in the code enforces it, and the same document's own
-production reference configs violate it: line 165
+**Status: fixed.** At the time of review, `docs/oidc-proxy-pairing.md:146`
+listed **"TLS-only end-to-end"** as a required mitigation while the same
+document's own production reference configs used plaintext — line 165
 (`upstreams = [ "http://nexus:8081/" ]`) and line 199
-(`NEXUS_UPSTREAM=http://nexus:8081/`). A deployer copy-pasting §4b gets a
-plaintext proxy→Nexus hop carrying the RutAuth identity header — the
+(`NEXUS_UPSTREAM=http://nexus:8081/`). A deployer copy-pasting §4b got a
+plaintext proxy→Nexus hop carrying the RutAuth identity header, the
 credential-equivalent of the entire architecture.
 
-`KEYCLOAK_URL`, `NEXUS_URL`, `KEYCLOAK_ISSUER` and `NEXUS_UPSTREAM` are
-free-form `String`s in `src/config.rs` with no scheme validation:
+All four URLs are now validated at startup (`validate_upstream_url` in
+`src/config.rs`): a malformed URL, a non-HTTP scheme, or a missing host is a
+startup failure, and **plaintext `http://` is refused unless
+`ALLOW_INSECURE_HTTP=1`** is set deliberately. The reference configs now use
+`https://`, and the dev stack sets the opt-in explicitly. The mitigation is
+enforced rather than advisory.
+
+The hops this protects, all of which were free-form `String`s with no
+validation:
 
 | Hop | What crosses it | Enforced? |
 |---|---|---|
@@ -215,14 +222,16 @@ carry credentials get no validation at all. Parsing both as a `Url` at startup
 and requiring `https` absent an explicit opt-in would follow a precedent
 already present in the same function.
 
-**On the unverified JWT.** `decode_jwt_claims` (`src/ropc.rs:249`) does not
-verify the token signature, justified in comment by the token having arrived
-over the proxy's own connection to Keycloak. That reasoning is sound *if* the
-connection is authenticated TLS. With `KEYCLOAK_ISSUER=http://…`, an on-path
-attacker can return a token whose `preferred_username` is any user they like,
-and the proxy injects it as a trusted identity. **This is not a bug today —
-it is a correct decision resting on a premise the code does not check.**
-Validating the issuer scheme at startup converts the premise into a guarantee.
+**On the unverified JWT.** `decode_jwt_claims` does not verify the token
+signature, justified in comment by the token having arrived over the proxy's
+own connection to Keycloak. That reasoning is sound *if* the connection is
+authenticated TLS. With `KEYCLOAK_ISSUER=http://…`, an on-path attacker could
+return a token whose `preferred_username` is any user they like, and the proxy
+would inject it as a trusted identity. It was never a bug — it was a correct
+decision resting on a premise the code did not check. The startup validation
+above now checks it, so the premise is a guarantee rather than an assumption,
+except where an operator sets `ALLOW_INSECURE_HTTP=1` and thereby takes it
+back on purpose.
 
 ### 2.5 Availability of the ROPC path
 
@@ -562,7 +571,7 @@ proxy, and each was checked rather than assumed.
 | 2.7 | `IDENTITY_CLAIM` uniqueness/immutability requirement unstated | medium (config-dependent) | documented here |
 | 2.8 | Keycloak group-admin ⇒ Nexus admin — privilege coupling unstated | medium | documented here |
 | 2.9 | ROPC listener reachability is a lockout-DoS decision, not just a guessing surface | medium | documented here |
-| 2.4 | `oidc-proxy-pairing.md` mandates TLS-only (:146) and then ships plaintext reference configs (:165, :199) | medium | open |
+| 2.4 | `oidc-proxy-pairing.md` mandated TLS-only (:146) and then shipped plaintext reference configs (:165, :199) | medium | **fixed** — configs corrected; startup validation added ([#4](https://github.com/Rhizomo/cambium/issues/4)) |
 | 2.12 | Upstream error bodies logged verbatim | low | open |
 | 2.13 | Base images unpinned; no CI `permissions:`; no audit gate | low | open |
 
@@ -573,7 +582,7 @@ proxy, and each was checked rather than assumed.
 | — | **Keycloak `enabled: false` is never honored** — see below | **medium-high** | [#1](https://github.com/Rhizomo/cambium/issues/1) |
 | 2.5 | No HTTP timeouts on any `reqwest::Client` | medium | [#2](https://github.com/Rhizomo/cambium/issues/2) |
 | 2.11 | `X-Forwarded-For` forwarded verbatim; real peer address never recorded | medium | [#3](https://github.com/Rhizomo/cambium/issues/3) |
-| 2.4 | No startup validation of `NEXUS_UPSTREAM` / `KEYCLOAK_ISSUER` scheme | medium | [#4](https://github.com/Rhizomo/cambium/issues/4) |
+| 2.4 | No startup validation of `NEXUS_UPSTREAM` / `KEYCLOAK_ISSUER` scheme | medium | **fixed** in [#4](https://github.com/Rhizomo/cambium/issues/4) |
 | 2.6 | No reserved-username refusal in `sync` | medium | [#5](https://github.com/Rhizomo/cambium/issues/5) |
 | 2.13 | No `USER` directive — containers run as root; base images unpinned | low | [#6](https://github.com/Rhizomo/cambium/issues/6) |
 | 4 | No `cargo audit` gate in CI | low | [#7](https://github.com/Rhizomo/cambium/issues/7) |

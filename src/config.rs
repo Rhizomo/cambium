@@ -44,14 +44,15 @@ impl Config {
         let role_map_raw = env_require("ROLE_MAP");
         let role_map = parse_role_map(&role_map_raw)
             .unwrap_or_else(|e| panic!("invalid ROLE_MAP: {e}"));
+        let allow_insecure = allow_insecure_http();
 
         Self {
-            keycloak_url: env_require("KEYCLOAK_URL"),
+            keycloak_url: require_url("KEYCLOAK_URL", allow_insecure),
             keycloak_realm: env_require("KEYCLOAK_REALM"),
             keycloak_client_id: env_require("KEYCLOAK_CLIENT_ID"),
             keycloak_client_secret: env_require("KEYCLOAK_CLIENT_SECRET"),
 
-            nexus_url: env_require("NEXUS_URL"),
+            nexus_url: require_url("NEXUS_URL", allow_insecure),
             nexus_username: env_require("NEXUS_USERNAME"),
             nexus_password: env_require("NEXUS_PASSWORD"),
 
@@ -75,6 +76,81 @@ impl Config {
             )),
         }
     }
+}
+
+/// Whether plaintext `http://` is permitted for the upstream URLs.
+///
+/// Off by default. Every one of those hops carries a credential — the user's
+/// password to Keycloak, the RutAuth identity header to Nexus, a Keycloak
+/// admin bearer token, Nexus admin Basic Auth — and
+/// `docs/oidc-proxy-pairing.md` already lists "TLS-only end-to-end" as a
+/// required mitigation. This makes that requirement enforced rather than
+/// merely written down.
+///
+/// The escape hatch exists because same-pod loopback and the local dev stack
+/// are legitimately plaintext. It has to be set deliberately, so a production
+/// deployment cannot end up on plaintext by inheriting a default.
+fn allow_insecure_http() -> bool {
+    matches!(
+        env_or("ALLOW_INSECURE_HTTP", "false").trim().to_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+/// Validates one upstream URL at startup and returns it unchanged.
+///
+/// Fails fast on a malformed URL, a non-HTTP scheme, a missing host, or —
+/// unless `ALLOW_INSECURE_HTTP` is set — a plaintext one. Startup is the right
+/// place: the alternative is discovering it per-request, which for
+/// `KEYCLOAK_ISSUER` specifically means discovering it as a silent downgrade
+/// of the trust the unverified-JWT decode depends on (see
+/// `ropc::decode_jwt_claims` and THREAT_MODEL.md 2.4), not as an error.
+///
+/// Returns the input verbatim rather than `Url`'s normalized form, because
+/// callers build paths by string concatenation and normalization would add a
+/// trailing slash that changes the resulting URLs.
+pub fn validate_upstream_url(var_name: &str, raw: &str, allow_insecure: bool) -> CambiumResult<String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| CambiumError::InvalidUpstreamUrl {
+            var: var_name.to_string(),
+            value: raw.to_string(),
+            reason: e.to_string(),
+        })?;
+
+    let scheme = parsed.scheme();
+    if scheme != "https" && scheme != "http" {
+        return Err(CambiumError::InvalidUpstreamUrl {
+            var: var_name.to_string(),
+            value: raw.to_string(),
+            reason: format!("scheme must be http or https, got {scheme:?}"),
+        });
+    }
+
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(CambiumError::InvalidUpstreamUrl {
+            var: var_name.to_string(),
+            value: raw.to_string(),
+            reason: "no host".to_string(),
+        });
+    }
+
+    if scheme == "http" && !allow_insecure {
+        return Err(CambiumError::InvalidUpstreamUrl {
+            var: var_name.to_string(),
+            value: raw.to_string(),
+            reason: "plaintext http:// carries credentials in the clear; use https://, or set \
+                     ALLOW_INSECURE_HTTP=1 to accept it deliberately (same-pod loopback, dev)"
+                .to_string(),
+        });
+    }
+
+    Ok(raw.to_string())
+}
+
+fn require_url(var_name: &str, allow_insecure: bool) -> String {
+    let raw = env_require(var_name);
+    validate_upstream_url(var_name, &raw, allow_insecure)
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Nexus's own built-in local accounts. Overridable via `RESERVED_USERNAMES`
@@ -143,12 +219,14 @@ pub struct RopcConfig {
 
 impl RopcConfig {
     pub fn from_env() -> Self {
+        let allow_insecure = allow_insecure_http();
+
         Self {
-            keycloak_issuer: env_require("KEYCLOAK_ISSUER"),
+            keycloak_issuer: require_url("KEYCLOAK_ISSUER", allow_insecure),
             keycloak_ropc_client_id: env_require("KEYCLOAK_ROPC_CLIENT_ID"),
             keycloak_ropc_client_secret: env_require("KEYCLOAK_ROPC_CLIENT_SECRET"),
             identity_claim: env_or("IDENTITY_CLAIM", "preferred_username"),
-            nexus_upstream: env_require("NEXUS_UPSTREAM"),
+            nexus_upstream: require_url("NEXUS_UPSTREAM", allow_insecure),
             rutauth_header: env_require("RUTAUTH_HEADER"),
             cache_ttl_seconds: env_or("CACHE_TTL_SECONDS", "60")
                 .parse()
@@ -182,6 +260,71 @@ mod tests {
     fn ignores_trailing_comma() {
         let map = parse_role_map("kc-dev:nx-developer,").unwrap();
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn https_upstream_is_accepted() {
+        assert!(validate_upstream_url("NEXUS_URL", "https://nexus.example.com", false).is_ok());
+        assert!(validate_upstream_url(
+            "KEYCLOAK_ISSUER",
+            "https://kc.example.com/realms/myrealm",
+            false
+        )
+        .is_ok());
+    }
+
+    /// The default has to reject plaintext, or the "TLS-only end-to-end"
+    /// mitigation stays a documentation claim rather than a guarantee.
+    #[test]
+    fn plaintext_upstream_is_rejected_by_default() {
+        let err = validate_upstream_url("NEXUS_UPSTREAM", "http://nexus:8081", false)
+            .expect_err("plaintext must not be accepted without the opt-in");
+        let msg = err.to_string();
+        assert!(msg.contains("NEXUS_UPSTREAM"), "names the var: {msg}");
+        assert!(msg.contains("ALLOW_INSECURE_HTTP"), "names the escape hatch: {msg}");
+    }
+
+    /// Same-pod loopback and the dev stack are legitimately plaintext, but it
+    /// has to be opted into rather than inherited from a default.
+    #[test]
+    fn plaintext_upstream_is_accepted_with_the_explicit_opt_in() {
+        assert!(validate_upstream_url("NEXUS_UPSTREAM", "http://nexus:8081", true).is_ok());
+    }
+
+    /// A schemeless value used to fail closed as a 502 per request; catching
+    /// it at startup turns a recurring runtime fault into one clear message.
+    #[test]
+    fn schemeless_or_malformed_upstream_is_rejected() {
+        for raw in ["nexus:8081", "", "not a url", "//nexus:8081"] {
+            assert!(
+                validate_upstream_url("NEXUS_UPSTREAM", raw, true).is_err(),
+                "{raw:?} must be rejected"
+            );
+        }
+    }
+
+    /// Only http(s) — a `file://` or `ftp://` upstream is always a
+    /// misconfiguration, opt-in or not.
+    #[test]
+    fn non_http_schemes_are_rejected_even_with_the_opt_in() {
+        for raw in ["file:///etc/passwd", "ftp://nexus/", "gopher://nexus/"] {
+            assert!(
+                validate_upstream_url("NEXUS_UPSTREAM", raw, true).is_err(),
+                "{raw:?} must be rejected"
+            );
+        }
+    }
+
+    /// Returned verbatim: callers concatenate paths onto these strings, and
+    /// `Url`'s normalized form would add a trailing slash and change the
+    /// resulting request URLs.
+    #[test]
+    fn a_valid_url_is_returned_unchanged() {
+        let raw = "https://nexus.example.com/context";
+        assert_eq!(
+            validate_upstream_url("NEXUS_URL", raw, false).unwrap(),
+            raw
+        );
     }
 
     #[test]

@@ -30,6 +30,13 @@ pub enum CambiumError {
         source: std::io::Error,
     },
 
+    #[error("invalid {var} {value:?}: {reason}")]
+    InvalidUpstreamUrl {
+        var: String,
+        value: String,
+        reason: String,
+    },
+
     #[error("invalid ROLE_MAP entry {0:?} (expected \"keycloak-group:nexus-role\")")]
     InvalidRoleMapEntry(String),
 }
