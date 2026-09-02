@@ -57,6 +57,21 @@ pub fn reconcile_roles(input: &ReconcileInput) -> ReconcileOutcome {
     ReconcileOutcome { new_roles, changed }
 }
 
+/// Whether Cambium must refuse to touch this Nexus `userId`.
+///
+/// Nexus ships built-in local accounts (`admin`, `anonymous`), and
+/// `RutAuthRealm` maps a header value straight onto a `userId` with no
+/// verification — so a Keycloak user named `admin` authenticates as Nexus's
+/// built-in superuser regardless of anything in `ROLE_MAP`. Cambium cannot
+/// close that (it is a property of RutAuth, see THREAT_MODEL.md 2.6), but it
+/// must not make it worse by provisioning or re-roling those accounts itself.
+///
+/// Case-insensitive: Nexus resolves `userId` case-insensitively, so `Admin`
+/// reaches the same account as `admin`.
+pub fn is_reserved_username(username: &str, reserved: &HashSet<String>) -> bool {
+    reserved.contains(&username.to_lowercase())
+}
+
 /// Maps a set of effective Keycloak realm role names through `role_map`
 /// (Keycloak realm role name -> Nexus role ID) to the subset that Cambium
 /// knows how to translate. Roles with no configured mapping are silently
@@ -187,6 +202,7 @@ async fn discover_group_tree_members<S: GroupTreeSource>(
 /// 2. Once a user is discovered by either path,
 /// `effective_realm_roles` below recomputes their full direct-or-inherited
 /// role set anyway, so which path found them doesn't affect the outcome.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pass(
     kc: &KeycloakClient,
     nexus: &NexusClient,
@@ -194,6 +210,7 @@ pub async fn run_pass(
     role_map: &HashMap<String, String>,
     manifest: &mut Manifest,
     fallback_email_domain: &str,
+    reserved_usernames: &HashSet<String>,
     state_file: &Path,
 ) -> CambiumResult<()> {
     let groups = kc.list_groups(kc_realm).await?;
@@ -231,6 +248,15 @@ pub async fn run_pass(
 
     for (user_id, user) in members {
         let username = user.username.as_str();
+        if is_reserved_username(username, reserved_usernames) {
+            warn!(
+                username,
+                "keycloak username collides with a reserved Nexus account; refusing to sync it \
+                 (anyone authenticating under this name via RutAuth reaches Nexus's own local \
+                 account — see THREAT_MODEL.md 2.6)"
+            );
+            continue;
+        }
         match sync_one_user(
             kc,
             nexus,
@@ -782,6 +808,42 @@ mod tests {
         );
 
         assert!(members.get("u1").unwrap().enabled);
+    }
+
+    /// The guard exists because RutAuth maps a header value straight onto a
+    /// Nexus `userId`, so a Keycloak user named `admin` reaches Nexus's own
+    /// built-in superuser. Cambium can't stop that, but it must not provision
+    /// or re-role the account itself.
+    #[test]
+    fn reserved_usernames_are_matched_case_insensitively() {
+        let reserved = crate::config::parse_reserved_usernames(
+            crate::config::DEFAULT_RESERVED_USERNAMES,
+        );
+
+        assert!(is_reserved_username("admin", &reserved));
+        assert!(is_reserved_username("Admin", &reserved));
+        assert!(is_reserved_username("ADMIN", &reserved));
+        assert!(is_reserved_username("anonymous", &reserved));
+    }
+
+    #[test]
+    fn ordinary_usernames_are_not_reserved() {
+        let reserved = crate::config::parse_reserved_usernames(
+            crate::config::DEFAULT_RESERVED_USERNAMES,
+        );
+
+        assert!(!is_reserved_username("alice", &reserved));
+        // Substring of a reserved name, not a match.
+        assert!(!is_reserved_username("admin-tools", &reserved));
+        assert!(!is_reserved_username("alice@example.com", &reserved));
+    }
+
+    /// An empty `RESERVED_USERNAMES` is a deliberate opt-out, not a default
+    /// that silently protects nothing.
+    #[test]
+    fn an_empty_reserved_set_matches_nothing() {
+        let reserved = crate::config::parse_reserved_usernames("");
+        assert!(!is_reserved_username("admin", &reserved));
     }
 
     /// The revocation half of the disabled-user fix: resolving a disabled

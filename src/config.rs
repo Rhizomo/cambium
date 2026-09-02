@@ -2,7 +2,7 @@
 //! (`env_require` panics with a clear message on a missing required var,
 //! `env_or` supplies a default).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 
@@ -28,6 +28,12 @@ pub struct Config {
     pub poll_interval_seconds: u64,
     pub state_file: PathBuf,
     pub fallback_email_domain: String,
+    /// Nexus `userId`s Cambium refuses to sync, lowercased. Nexus ships
+    /// built-in local accounts, and RutAuth maps a header value straight onto
+    /// a `userId` — so a Keycloak user named `admin` authenticates as Nexus's
+    /// built-in superuser. Cambium cannot stop RutAuth trusting the header,
+    /// but it can decline to provision or modify those accounts itself.
+    pub reserved_usernames: HashSet<String>,
     /// v1 is single-instance-only (see docs/sync-semantics.md and
     /// README.md) — this is the `flock`'d file that enforces it.
     pub lock_file: PathBuf,
@@ -59,12 +65,32 @@ impl Config {
                 "/var/lib/cambium/state.json",
             )),
             fallback_email_domain: env_or("FALLBACK_EMAIL_DOMAIN", "cambium.invalid"),
+            reserved_usernames: parse_reserved_usernames(&env_or(
+                "RESERVED_USERNAMES",
+                DEFAULT_RESERVED_USERNAMES,
+            )),
             lock_file: PathBuf::from(env_or(
                 "LOCK_FILE",
                 "/var/lib/cambium/cambium.lock",
             )),
         }
     }
+}
+
+/// Nexus's own built-in local accounts. Overridable via `RESERVED_USERNAMES`
+/// for deployments that have added more privileged local accounts of their
+/// own; setting it to an empty string disables the guard entirely.
+pub const DEFAULT_RESERVED_USERNAMES: &str = "admin,anonymous";
+
+/// `"admin, anonymous"` -> lowercased set. Comparison is case-insensitive
+/// because Nexus treats `userId` case-insensitively on lookup, so `Admin`
+/// would reach the same built-in account as `admin`.
+pub fn parse_reserved_usernames(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
 }
 
 /// `"kc-role-a:nx-role-a,kc-role-b:nx-role-b"` -> map. Whitespace around
@@ -156,6 +182,27 @@ mod tests {
     fn ignores_trailing_comma() {
         let map = parse_role_map("kc-dev:nx-developer,").unwrap();
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn parses_reserved_usernames_lowercased_and_trimmed() {
+        let set = parse_reserved_usernames(" Admin , ANONYMOUS ,, deploy-bot ");
+        assert!(set.contains("admin"));
+        assert!(set.contains("anonymous"));
+        assert!(set.contains("deploy-bot"));
+        assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn empty_reserved_usernames_disables_the_guard() {
+        assert!(parse_reserved_usernames("").is_empty());
+    }
+
+    #[test]
+    fn default_reserved_usernames_cover_nexus_builtins() {
+        let set = parse_reserved_usernames(DEFAULT_RESERVED_USERNAMES);
+        assert!(set.contains("admin"));
+        assert!(set.contains("anonymous"));
     }
 
     #[test]

@@ -119,6 +119,7 @@ async fn run_sync() {
             &config.role_map,
             &mut manifest,
             &config.fallback_email_domain,
+            &config.reserved_usernames,
             &config.state_file,
         )
         .await;

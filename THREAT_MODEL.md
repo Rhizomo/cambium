@@ -260,8 +260,20 @@ accounts and any colliding Keycloak username silently inherits one. The dev
 stack itself co-locates a Nexus `admin` (password `admin123`) with the
 Keycloak realm.
 
-Cambium could cheaply refuse to sync a reserved-name list; today the operator
-must guarantee no collisions exist.
+**Partially mitigated in code.** `cambium sync` now refuses to provision or
+re-role a reserved account: `is_reserved_username` (`src/sync.rs`) skips it
+with a `warn!` rather than syncing it. The list is `RESERVED_USERNAMES`,
+default `admin,anonymous`, comma-separated and matched case-insensitively
+(Nexus resolves `userId` case-insensitively, so `Admin` reaches the same
+account). Setting it empty disables the guard.
+
+That stops Cambium *making the collision worse* — it will no longer attach
+`ROLE_MAP` roles to a built-in account. **It does not close the underlying
+hole**, and cannot: RutAuth trusts the header regardless of what Cambium
+does, so a Keycloak user named `admin` still authenticates as Nexus's
+built-in superuser with whatever privileges that account already has.
+Guaranteeing no collision exists in the first place remains the operator's,
+per §1.
 
 ### 2.7 The identity claim has no uniqueness or immutability requirement
 
@@ -546,7 +558,7 @@ proxy, and each was checked rather than assumed.
 |---|---|---|---|
 | 2.1 | Network isolation of Nexus is a hard requirement, stated nowhere in the public repo | **high** | **fixed** — `README.md`, `ARCHITECTURE.md` |
 | 2.2 | `CONTRIBUTING.md:55-58` claimed direct-to-Nexus access is already rejected — false | **high** | **fixed** — verified, then corrected |
-| 2.6 | Reserved Nexus usernames (`admin`, `anonymous`) — collision guarantee is the operator's | medium | documented here; code guard open |
+| 2.6 | Reserved Nexus usernames (`admin`, `anonymous`) — collision guarantee is the operator's | medium | documented; Cambium-side guard added ([#5](https://github.com/Rhizomo/cambium/issues/5)) |
 | 2.7 | `IDENTITY_CLAIM` uniqueness/immutability requirement unstated | medium (config-dependent) | documented here |
 | 2.8 | Keycloak group-admin ⇒ Nexus admin — privilege coupling unstated | medium | documented here |
 | 2.9 | ROPC listener reachability is a lockout-DoS decision, not just a guessing surface | medium | documented here |
