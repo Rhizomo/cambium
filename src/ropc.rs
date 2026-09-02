@@ -19,13 +19,14 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -425,9 +426,45 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// Forwarding hints the client does not get to dictate. `x-forwarded-for` is
+/// rebuilt below from the real peer address; `-proto` and `-host` describe the
+/// connection *this* proxy accepted, so a client-supplied value is a claim
+/// about someone else's hop and is dropped rather than relayed.
+const CLIENT_CONTROLLED_FORWARDING_HEADERS: &[&str] =
+    &["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"];
+
 fn is_forwardable_request_header(name: &HeaderName) -> bool {
     let n = name.as_str().to_ascii_lowercase();
-    n != "authorization" && n != "host" && !HOP_BY_HOP.contains(&n.as_str())
+    n != "authorization"
+        && n != "host"
+        && !HOP_BY_HOP.contains(&n.as_str())
+        && !CLIENT_CONTROLLED_FORWARDING_HEADERS.contains(&n.as_str())
+}
+
+/// Builds the `X-Forwarded-For` value to send upstream: the inbound chain
+/// with this connection's real peer address appended.
+///
+/// Appending rather than replacing keeps the chain intact when Cambium runs
+/// behind an ingress that terminates TLS — the deployment `docs/oidc-proxy-pairing.md`
+/// §4b describes — where the peer address is the ingress and the original
+/// client IP is only present in the inbound header.
+///
+/// The security property this gives, and the one it does not:
+///
+/// - **Guaranteed**: the *rightmost* entry is written by this proxy from the
+///   kernel's view of the socket and cannot be forged by the client.
+/// - **Not guaranteed**: everything to its left. A client may send an
+///   arbitrary `X-Forwarded-For` and those entries are relayed as-is. They are
+///   only as trustworthy as the proxies actually in front of Cambium. Anything
+///   consuming this for audit or rate limiting must count hops from the right,
+///   never trust the leftmost entry, and never treat the header as a whole as
+///   attacker-free.
+fn build_forwarded_for(inbound: Option<&HeaderValue>, peer: SocketAddr) -> String {
+    let peer_ip = peer.ip().to_string();
+    match inbound.and_then(|v| v.to_str().ok()).map(str::trim) {
+        Some(existing) if !existing.is_empty() => format!("{existing}, {peer_ip}"),
+        _ => peer_ip,
+    }
 }
 
 fn is_forwardable_response_header(name: &HeaderName) -> bool {
@@ -447,7 +484,11 @@ pub struct RopcState {
     pub requests_handled: AtomicU64,
 }
 
-async fn proxy_handler(State(state): State<Arc<RopcState>>, req: Request) -> Response {
+async fn proxy_handler(
+    State(state): State<Arc<RopcState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
     state.requests_handled.fetch_add(1, Ordering::Relaxed);
 
     let auth_header = req
@@ -472,7 +513,7 @@ async fn proxy_handler(State(state): State<Arc<RopcState>>, req: Request) -> Res
         }
     };
 
-    match forward_to_nexus(&state, &identity, req).await {
+    match forward_to_nexus(&state, &identity, peer, req).await {
         Ok(resp) => resp,
         Err(RopcError::IdentityNotHeaderSafe(bad_identity)) => {
             // `{:?}` (Debug) escapes control characters/newlines, so this
@@ -492,7 +533,12 @@ async fn proxy_handler(State(state): State<Arc<RopcState>>, req: Request) -> Res
     }
 }
 
-async fn forward_to_nexus(state: &Arc<RopcState>, identity: &str, req: Request) -> Result<Response, RopcError> {
+async fn forward_to_nexus(
+    state: &Arc<RopcState>,
+    identity: &str,
+    peer: SocketAddr,
+    req: Request,
+) -> Result<Response, RopcError> {
     let (parts, body) = req.into_parts();
     let upstream_url = build_upstream_url(&state.nexus_upstream, &parts.uri);
 
@@ -508,6 +554,16 @@ async fn forward_to_nexus(state: &Arc<RopcState>, identity: &str, req: Request) 
             }
         }
     }
+    // Rebuilt from the real peer address rather than relayed: the inbound
+    // value is entirely client-controlled. See `build_forwarded_for`.
+    let forwarded_for = build_forwarded_for(parts.headers.get("x-forwarded-for"), peer);
+    if let Ok(xff) = reqwest::header::HeaderValue::from_str(&forwarded_for) {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-forwarded-for"),
+            xff,
+        );
+    }
+
     // If the identity claim can't be encoded as a valid HTTP header value
     // (Keycloak claims are fairly permissive about content — a raw
     // newline/control character, non-ASCII byte, etc. is possible depending
@@ -629,9 +685,15 @@ pub async fn run(config: RopcConfig) -> anyhow::Result<()> {
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     info!(addr = %config.listen_addr, "listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // `into_make_service_with_connect_info` is what makes the peer address
+    // available to `proxy_handler`; without it the `ConnectInfo` extractor
+    // fails and every request 500s.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     info!("graceful drain complete, exiting");
     Ok(())
 }
@@ -1100,6 +1162,122 @@ mod tests {
         })
     }
 
+    /// A client-supplied `X-Forwarded-For` must not reach Nexus unchanged:
+    /// the rightmost entry has to be this proxy's view of the socket, so
+    /// anything reading the header from the right gets a truthful hop.
+    #[test]
+    fn forwarded_for_appends_the_real_peer_to_a_client_supplied_chain() {
+        let inbound = HeaderValue::from_static("198.51.100.9, 192.0.2.1");
+        let built = build_forwarded_for(Some(&inbound), test_peer());
+
+        assert_eq!(built, "198.51.100.9, 192.0.2.1, 203.0.113.7");
+        assert!(built.ends_with("203.0.113.7"), "peer must be rightmost");
+    }
+
+    /// With no inbound header, the value is exactly the peer — not an empty
+    /// leading entry, which would make hop-counting from the right wrong.
+    #[test]
+    fn forwarded_for_is_just_the_peer_when_no_inbound_header() {
+        assert_eq!(build_forwarded_for(None, test_peer()), "203.0.113.7");
+    }
+
+    /// An empty or whitespace-only inbound header is treated as absent, for
+    /// the same hop-counting reason.
+    #[test]
+    fn forwarded_for_ignores_an_empty_inbound_header() {
+        let empty = HeaderValue::from_static("   ");
+        assert_eq!(build_forwarded_for(Some(&empty), test_peer()), "203.0.113.7");
+    }
+
+    /// The port is deliberately dropped — `X-Forwarded-For` carries addresses,
+    /// and leaking the ephemeral source port helps nothing downstream.
+    #[test]
+    fn forwarded_for_records_the_address_without_the_port() {
+        let built = build_forwarded_for(None, test_peer());
+        assert!(!built.contains("54321"), "port must not appear: {built}");
+    }
+
+    /// The three forwarding hints a client could otherwise use to lie about
+    /// its own hop are dropped by the filter; `x-forwarded-for` is then
+    /// re-added from the real peer by `forward_to_nexus`.
+    #[test]
+    fn client_supplied_forwarding_headers_are_not_relayed() {
+        for name in ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"] {
+            let header = HeaderName::from_bytes(name.as_bytes()).unwrap();
+            assert!(
+                !is_forwardable_request_header(&header),
+                "{name} must not be forwarded straight from the client"
+            );
+        }
+        // Case variants collapse onto the same normalized name.
+        assert!(!is_forwardable_request_header(&HeaderName::from_static(
+            "x-forwarded-for"
+        )));
+    }
+
+    /// Guard against over-stripping: the RutAuth header and ordinary request
+    /// headers must still be forwarded.
+    #[test]
+    fn unrelated_headers_are_still_forwarded() {
+        for name in ["accept", "content-type", "user-agent", "x-forwarded-user"] {
+            let header = HeaderName::from_bytes(name.as_bytes()).unwrap();
+            assert!(
+                is_forwardable_request_header(&header),
+                "{name} must still be forwarded"
+            );
+        }
+    }
+
+    /// `ConnectInfo<SocketAddr>` only resolves if the server was started with
+    /// `into_make_service_with_connect_info`. Wired any other way this
+    /// compiles fine and then fails the extractor on every request, so this
+    /// drives a real listener and a real request rather than calling the
+    /// handler directly — the unit tests above would not catch it.
+    #[tokio::test]
+    async fn router_serves_requests_with_connect_info_wired() {
+        let state = dummy_state("http://127.0.0.1:1");
+        let app = build_router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("resolve bound address");
+
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("server runs until the test drops it");
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/service/rest/v1/status"))
+            .send()
+            .await
+            .expect("request reaches the proxy");
+
+        // No Authorization header, so the expected answer is the 401
+        // challenge. A 500 here means the ConnectInfo extractor failed, which
+        // is the regression this test exists for.
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "expected the Basic challenge, not an extractor failure"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some(r#"Basic realm="Nexus""#)
+        );
+    }
+
+    fn test_peer() -> SocketAddr {
+        "203.0.113.7:54321".parse().expect("valid test peer address")
+    }
+
     fn dummy_request() -> Request {
         Request::builder()
             .method("GET")
@@ -1119,7 +1297,9 @@ mod tests {
         let state = dummy_state("http://127.0.0.1:1"); // port 0/1 is never a live listener
         let identity_with_raw_newline = "alice\ninjected-header: evil";
 
-        let result = forward_to_nexus(&state, identity_with_raw_newline, dummy_request()).await;
+        let result =
+            forward_to_nexus(&state, identity_with_raw_newline, test_peer(), dummy_request())
+                .await;
 
         match result {
             Err(RopcError::IdentityNotHeaderSafe(bad)) => {
@@ -1136,7 +1316,9 @@ mod tests {
         // HTTP header value.
         let identity_with_control_char = "alice\u{0007}bell";
 
-        let result = forward_to_nexus(&state, identity_with_control_char, dummy_request()).await;
+        let result =
+            forward_to_nexus(&state, identity_with_control_char, test_peer(), dummy_request())
+                .await;
 
         assert!(
             matches!(result, Err(RopcError::IdentityNotHeaderSafe(_))),
